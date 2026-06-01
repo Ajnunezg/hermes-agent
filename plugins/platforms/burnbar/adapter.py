@@ -607,6 +607,7 @@ def register(ctx) -> None:
         allow_all_env="BURNBAR_ALLOW_ALL_USERS",
         cron_deliver_env_var="BURNBAR_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        supports_media=True,
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="🔥",
         platform_hint=(

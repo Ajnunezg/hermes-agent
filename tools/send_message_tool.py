@@ -502,6 +502,14 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    entry = None
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        entry = None
+
     runner = None
     try:
         from gateway.run import _gateway_runner_ref
@@ -517,7 +525,17 @@ async def _send_via_adapter(
         if adapter is not None:
             try:
                 metadata = {"thread_id": thread_id} if thread_id else None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                if media_files and entry is not None and entry.supports_media:
+                    result = await _send_plugin_media_via_live_adapter(
+                        adapter,
+                        chat_id,
+                        chunk,
+                        media_files=media_files,
+                        metadata=metadata,
+                        force_document=force_document,
+                    )
+                else:
+                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -525,14 +543,6 @@ async def _send_via_adapter(
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {result.error}"}
-
-    platform_name = platform.value if hasattr(platform, "value") else str(platform)
-    entry = None
-    try:
-        from gateway.platform_registry import platform_registry
-        entry = platform_registry.get(platform_name)
-    except Exception:
-        entry = None
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
@@ -568,6 +578,65 @@ async def _send_via_adapter(
             f"register a standalone_sender_fn on its PlatformEntry."
         )
     }
+
+
+async def _send_plugin_media_via_live_adapter(
+    adapter,
+    chat_id,
+    message,
+    *,
+    media_files,
+    metadata=None,
+    force_document=False,
+):
+    """Deliver plugin MEDIA files through a live adapter's native methods."""
+    last_result = None
+    pending_caption = message
+    for media_path, is_voice in media_files or []:
+        suffix = os.path.splitext(str(media_path))[1].lower()
+        caption = pending_caption
+        pending_caption = None
+        if force_document:
+            result = await adapter.send_document(
+                chat_id=chat_id,
+                file_path=media_path,
+                caption=caption,
+                metadata=metadata,
+            )
+        elif is_voice or suffix in _VOICE_EXTS:
+            result = await adapter.send_voice(
+                chat_id=chat_id,
+                audio_path=media_path,
+                caption=caption,
+                metadata=metadata,
+            )
+        elif suffix in _IMAGE_EXTS:
+            result = await adapter.send_image_file(
+                chat_id=chat_id,
+                image_path=media_path,
+                caption=caption,
+                metadata=metadata,
+            )
+        elif suffix in _VIDEO_EXTS:
+            result = await adapter.send_video(
+                chat_id=chat_id,
+                video_path=media_path,
+                caption=caption,
+                metadata=metadata,
+            )
+        else:
+            result = await adapter.send_document(
+                chat_id=chat_id,
+                file_path=media_path,
+                caption=caption,
+                metadata=metadata,
+            )
+        if not getattr(result, "success", False):
+            return result
+        last_result = result
+    if last_result is not None:
+        return last_result
+    return await adapter.send(chat_id=chat_id, content=message, metadata=metadata)
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
@@ -749,8 +818,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    plugin_supports_media = False
+    try:
+        from gateway.platform_registry import platform_registry
+        platform_name = platform.value if hasattr(platform, "value") else str(platform)
+        entry = platform_registry.get(platform_name)
+        plugin_supports_media = bool(entry and entry.supports_media)
+    except Exception:
+        plugin_supports_media = False
+
     # --- Non-media platforms ---
-    if media_files and not message.strip():
+    if media_files and not message.strip() and not plugin_supports_media:
         return {
             "error": (
                 f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
@@ -758,7 +836,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             )
         }
     warning = None
-    if media_files:
+    if media_files and not plugin_supports_media:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
             "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"

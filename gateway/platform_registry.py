@@ -141,6 +141,11 @@ class PlatformEntry:
     # resolve the default chat/room ID.  Empty = no cron home-channel support.
     cron_deliver_env_var: str = ""
 
+    # Whether the platform's adapter / standalone sender can deliver native
+    # MEDIA attachments from send_message. False keeps the historical safe
+    # fallback: reject media-only sends and warn when text sends omit media.
+    supports_media: bool = False
+
     # ── Standalone (out-of-process) sending ──
     # Optional: async coroutine that delivers a message without a live
     # gateway adapter.  Called by ``tools/send_message_tool._send_via_adapter``

@@ -2421,7 +2421,7 @@ class TestSendViaAdapterStandaloneFallback:
     """
 
     @staticmethod
-    def _make_entry(send_fn):
+    def _make_entry(send_fn, *, supports_media=False):
         from gateway.platform_registry import PlatformEntry
 
         return PlatformEntry(
@@ -2430,6 +2430,7 @@ class TestSendViaAdapterStandaloneFallback:
             adapter_factory=lambda cfg: None,
             check_fn=lambda: True,
             standalone_sender_fn=send_fn,
+            supports_media=supports_media,
         )
 
     @pytest.mark.asyncio
@@ -2500,6 +2501,79 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["thread_id"] == "thread-7"
         assert recorded["media_files"] == ["/tmp/a.png"]
         assert recorded["force_document"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_to_platform_allows_media_only_for_media_capable_plugin(self, monkeypatch):
+        """Media-capable plugins receive MEDIA-only sends instead of the
+        generic non-media-platform rejection."""
+        from gateway.platform_registry import platform_registry
+
+        recorded = {}
+
+        async def fake_send(pconfig, chat_id, message, *, thread_id=None,
+                            media_files=None, force_document=False):
+            recorded["message"] = message
+            recorded["media_files"] = media_files
+            return {"success": True, "message_id": "media-1"}
+
+        platform_registry.register(self._make_entry(fake_send, supports_media=True))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+            result = await _send_to_platform(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "",
+                media_files=[("/tmp/report.pdf", False)],
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "media-1"}
+        assert recorded["message"] == ""
+        assert recorded["media_files"] == [("/tmp/report.pdf", False)]
+
+    @pytest.mark.asyncio
+    async def test_live_adapter_media_uses_native_plugin_methods(self, monkeypatch):
+        """When the gateway is live, media-capable plugins should still get
+        native attachment delivery instead of adapter.send(text-only)."""
+        from gateway.platform_registry import platform_registry
+        from gateway.platforms.base import SendResult
+        from tools.send_message_tool import _send_via_adapter
+
+        calls = []
+
+        class FakeAdapter:
+            async def send(self, **kwargs):
+                raise AssertionError("text-only send should not be used for media")
+
+            async def send_document(self, **kwargs):
+                calls.append(kwargs)
+                return SendResult(success=True, message_id="doc-1")
+
+        platform = _FakePlatform("fakeplatform")
+        runner = SimpleNamespace(adapters={platform: FakeAdapter()})
+        platform_registry.register(self._make_entry(None, supports_media=True))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+            result = await _send_via_adapter(
+                platform,
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "caption",
+                media_files=[("/tmp/report.pdf", False)],
+                thread_id="thread-1",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "doc-1"}
+        assert calls == [{
+            "chat_id": "chat-1",
+            "file_path": "/tmp/report.pdf",
+            "caption": "caption",
+            "metadata": {"thread_id": "thread-1"},
+        }]
 
     @pytest.mark.asyncio
     async def test_standalone_sender_fn_absent_returns_helpful_error(self, monkeypatch):

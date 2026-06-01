@@ -318,12 +318,20 @@ ctx.register_platform(
     ...
     cron_deliver_env_var="MY_PLATFORM_HOME_CHANNEL",
     standalone_sender_fn=_standalone_send,
+    supports_media=True,  # only when live + standalone paths upload MEDIA files natively
 )
 ```
 
 Why this hook is necessary: built-in platforms (Telegram, Discord, Slack, etc.) ship direct REST helpers in `tools/send_message_tool.py` so cron can deliver without holding the gateway in the same process. Plugin platforms historically depended on `_gateway_runner_ref()`, which returns `None` outside the gateway process, so without `standalone_sender_fn` the cron-side send fails with `No live adapter for platform '<name>'`.
 
 The function receives the same `pconfig` and `chat_id` that the live adapter would, plus optional `thread_id`, `media_files`, and `force_document` keyword arguments. Returning `{"success": True, "message_id": ...}` is treated as a successful delivery; returning `{"error": "..."}` surfaces the message in cron's `delivery_errors`. Exceptions raised inside the function are caught by the dispatcher and reported as `Plugin standalone send failed: <reason>`. Reference implementations live in `plugins/platforms/{irc,teams,google_chat}/adapter.py`.
+
+Set `supports_media=True` only when both paths can deliver local `MEDIA:/path`
+attachments natively: the live adapter should override `send_document`,
+`send_image_file`, `send_voice`, and/or `send_video`, and the
+`standalone_sender_fn` should upload the provided `media_files`. When false,
+`send_message` rejects media-only sends for the plugin and warns when text sends
+omit attachments.
 
 ## Surfacing Env Vars in `hermes config`
 

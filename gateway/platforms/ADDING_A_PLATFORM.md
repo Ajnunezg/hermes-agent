@@ -37,6 +37,10 @@ status display, gateway setup, and more.
   `deliver=<name>` job fires correctly but the actual send returns
   `No live adapter for platform '<name>'`.  Pair with `cron_deliver_env_var`
   for end-to-end cron support.  See the docsite for the signature.
+- `supports_media: bool` — set true only when the live adapter and
+  `standalone_sender_fn` both deliver `MEDIA:/path` attachments natively.
+  Otherwise `send_message` rejects media-only sends and warns when it omits
+  attachments for plugin platforms.
 - `plugin.yaml` `requires_env` / `optional_env` rich-dict entries —
   auto-populate `OPTIONAL_ENV_VARS` in `hermes_cli/config.py` so the setup
   wizard surfaces proper descriptions, prompts, password flags, and URLs.

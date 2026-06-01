@@ -230,6 +230,7 @@ def test_register_calls_register_platform():
     assert kwargs["allowed_users_env"] == "BURNBAR_ALLOWED_USERS"
     assert kwargs["allow_all_env"] == "BURNBAR_ALLOW_ALL_USERS"
     assert kwargs["cron_deliver_env_var"] == "BURNBAR_HOME_CHANNEL"
+    assert kwargs["supports_media"] is True
     assert kwargs["max_message_length"] == MAX_MESSAGE_LENGTH
     assert callable(kwargs["setup_fn"])
     assert callable(kwargs["env_enablement_fn"])
