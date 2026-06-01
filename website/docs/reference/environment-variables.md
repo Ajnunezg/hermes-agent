@@ -288,6 +288,12 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `GOOGLE_CHAT_MAX_BYTES` | Pub/Sub FlowControl max in-flight bytes (default: `16777216`, 16 MiB) |
 | `GOOGLE_CHAT_BOOTSTRAP_SPACES` | Comma-separated extra space IDs to probe at startup when resolving the bot's own `users/{id}` |
 | `GOOGLE_CHAT_DEBUG_RAW` | Set to any value to log redacted Pub/Sub envelopes at DEBUG level (debugging only) |
+| `BURNBAR_ACCESS_TOKEN` | BurnBar Hermes Gateway token issued by the BurnBar Cloud device-code flow |
+| `BURNBAR_API_BASE_URL` | BurnBar Hermes Gateway API base URL (default: `https://api.burnbar.ai/v1/hermes-gateway`) |
+| `BURNBAR_ALLOWED_USERS` | Comma-separated BurnBar sender IDs allowed to message the bot |
+| `BURNBAR_ALLOW_ALL_USERS` | Allow all BurnBar senders on this account without an allowlist (`true`/`false`) |
+| `BURNBAR_HOME_CHANNEL` | Default BurnBar destination for cron delivery and notifications |
+| `BURNBAR_HOME_CHANNEL_NAME` | Display name for the BurnBar home destination |
 | `WHATSAPP_ENABLED` | Enable the WhatsApp bridge (`true`/`false`) |
 | `WHATSAPP_MODE` | `bot` (separate number) or `self-chat` (message yourself) |
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code, no `+`), or `*` to allow all senders |
@@ -492,6 +498,21 @@ Used by the bundled LINE platform plugin (`plugins/platforms/line/`). See [Messa
 | `NTFY_HOME_CHANNEL_NAME` | Human label for the home channel (defaults to the topic name). |
 
 See [the ntfy messaging guide](/user-guide/messaging/ntfy) — particularly the **identity model** section — before deploying with untrusted topics.
+
+### BurnBar Cloud
+
+BurnBar Cloud uses a device-code setup flow: Hermes starts a link session, the
+user signs in to BurnBar Cloud or Cloud Pro, approves the code, and Hermes saves
+a scoped gateway token. See [BurnBar Cloud setup](/user-guide/messaging/burnbar).
+
+| Variable | Description |
+|----------|-------------|
+| `BURNBAR_ACCESS_TOKEN` | Scoped bearer token issued by BurnBar's device-code flow. Required. |
+| `BURNBAR_API_BASE_URL` | Gateway base URL. Defaults to `https://api.burnbar.ai/v1/hermes-gateway`. |
+| `BURNBAR_ALLOWED_USERS` | Comma-separated BurnBar sender IDs allowed to talk to Hermes. |
+| `BURNBAR_ALLOW_ALL_USERS` | Dev/personal escape hatch — accepts every sender on the connected BurnBar account. Default: `false`. |
+| `BURNBAR_HOME_CHANNEL` | Default BurnBar destination for cron jobs with `deliver: burnbar`. |
+| `BURNBAR_HOME_CHANNEL_NAME` | Human label for the home destination. |
 
 ### Advanced Messaging Tuning
 
