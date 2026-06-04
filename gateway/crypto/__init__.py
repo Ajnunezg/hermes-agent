@@ -11,14 +11,22 @@ sealing primitives from :mod:`gateway.crypto.relay_e2ee` so the agent can
 seal message text / attachment bodies to the paired phone's relay public key
 and unwrap inbound events sealed to its own relay public key — without the
 relay server ever seeing plaintext.
+
+The v3 key-wrap (:func:`wrap_symmetric_key_v3` / :func:`unwrap_symmetric_key_v3`)
+is the RFC 9180 HPKE Auth-mode replacement for the bespoke v2 key wrap; it lives
+beside the v1/v2 helpers so the adapter keeps a single crypto surface.
 """
 
 from .relay_e2ee import (
     ALGORITHM,
     KEY_VERSION,
+    HPKE_ALGORITHM,
+    HPKE_KEY_VERSION,
     HERMES_NAMESPACE,
     RelayNamespace,
     RelayPrivateKey,
+    RelayPublicKey,
+    RelayKeyWrapV3,
     AgentRelayIdentity,
     RelayCryptoError,
     InvalidPublicKeyError,
@@ -31,6 +39,8 @@ from .relay_e2ee import (
     open_base64,
     wrap_symmetric_key,
     unwrap_symmetric_key,
+    wrap_symmetric_key_v3,
+    unwrap_symmetric_key_v3,
     request_aad,
     key_aad,
     chunk_aad,
@@ -39,9 +49,13 @@ from .relay_e2ee import (
 __all__ = [
     "ALGORITHM",
     "KEY_VERSION",
+    "HPKE_ALGORITHM",
+    "HPKE_KEY_VERSION",
     "HERMES_NAMESPACE",
     "RelayNamespace",
     "RelayPrivateKey",
+    "RelayPublicKey",
+    "RelayKeyWrapV3",
     "AgentRelayIdentity",
     "RelayCryptoError",
     "InvalidPublicKeyError",
@@ -54,6 +68,8 @@ __all__ = [
     "open_base64",
     "wrap_symmetric_key",
     "unwrap_symmetric_key",
+    "wrap_symmetric_key_v3",
+    "unwrap_symmetric_key_v3",
     "request_aad",
     "key_aad",
     "chunk_aad",

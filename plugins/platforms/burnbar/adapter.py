@@ -89,6 +89,25 @@ RELAY_KEY_VERSION = relay_e2ee.KEY_VERSION if RELAY_CRYPTO_AVAILABLE else 1
 # envelopes stamp this and gateway opens hard-require it, so the relay can no
 # longer forge an event/reply/attachment by sealing to a known public key.
 GATEWAY_RELAY_KEY_VERSION = 2
+# The RFC 9180 HPKE Auth-mode gateway wrap version (v3). Emitted ONLY to a peer
+# whose authenticated capability advertises v3 (the BURNBAR_RELAY_PEER_KEY_VERSION
+# pin or a per-destination override); a v2-only peer is never auto-upgraded. The
+# open path accepts any pinned-sender v3 envelope; v1/plaintext stay refused.
+GATEWAY_RELAY_KEY_VERSION_V3 = relay_e2ee.HPKE_KEY_VERSION if RELAY_CRYPTO_AVAILABLE else 3
+GATEWAY_RELAY_ENCRYPTION_V3 = (
+    relay_e2ee.HPKE_ALGORITHM
+    if RELAY_CRYPTO_AVAILABLE
+    else "hpke-auth-p256-hkdfsha256-aes256gcm"
+)
+# Gateway wrap versions this agent emits/opens. The open path hard-refuses any
+# version outside this set (v1 and plaintext stay unreachable on a paired link),
+# and the send path floors unknown values to v2.
+_SUPPORTED_GATEWAY_RELAY_VERSIONS = (GATEWAY_RELAY_KEY_VERSION, GATEWAY_RELAY_KEY_VERSION_V3)
+# Operator/pairing-pinned peer wrap capability (authenticated, like
+# BURNBAR_RELAY_PEER_PUBLIC_KEY). Set to "3" once the paired phone is known to
+# support RFC 9180 HPKE v3; absent/unknown stays v2. Never read from the
+# untrusted relay runtime path (mirrors the _absorb_relay_state policy).
+RELAY_PEER_KEY_VERSION_ENV = "BURNBAR_RELAY_PEER_KEY_VERSION"
 # Single-source the AAD namespace from relay_e2ee. RelayNamespace.aad(parts)
 # yields the locked wire bytes "OpenBurnBar-HermesRelay-v1|" + "|".join(parts);
 # we reuse it with the gateway-flavoured parts so the prefix/version is never
@@ -303,6 +322,51 @@ def _coerce_replay_counter(value: Any) -> Optional[int]:
     return counter if counter >= 0 else None
 
 
+def _coerce_peer_relay_key_version(value: Any) -> int:
+    """Parse an advertised/configured peer wrap version to a SUPPORTED version.
+
+    Floors absent / malformed / unsupported values to the v2 gateway version so a
+    v2-only peer is never auto-upgraded and an unknown future version never
+    selects an unimplemented wrap path. Only an explicit, recognised ``3`` opts a
+    link into RFC 9180 HPKE v3.
+    """
+    counter = _coerce_replay_counter(value)
+    if counter in _SUPPORTED_GATEWAY_RELAY_VERSIONS:
+        return counter
+    return GATEWAY_RELAY_KEY_VERSION
+
+
+def _peer_relay_key_version_from_pairing_grant(approved: dict, client_payload: dict) -> int:
+    """Read peer gateway-wrap capability from the authenticated pairing grant.
+
+    Runtime relay state is untrusted and never upgrades a peer. The device-code
+    grant is the authenticated setup channel, so this is the only automatic path
+    that may persist a v3-capable peer. Unknown/missing values floor to v2.
+    """
+    candidates = (approved, client_payload)
+    version_keys = (
+        "gatewayRelayKeyVersion",
+        "peerRelayKeyVersion",
+        "phoneRelayKeyVersion",
+        "relayKeyVersion",
+    )
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        for key in version_keys:
+            version = _coerce_peer_relay_key_version(source.get(key))
+            if version == GATEWAY_RELAY_KEY_VERSION_V3:
+                return version
+    encryption_keys = ("gatewayRelayEncryption", "relayEncryption")
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        for key in encryption_keys:
+            if str(source.get(key) or "") == GATEWAY_RELAY_ENCRYPTION_V3:
+                return GATEWAY_RELAY_KEY_VERSION_V3
+    return GATEWAY_RELAY_KEY_VERSION
+
+
 def _guess_content_type(path: Path) -> str:
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
@@ -400,11 +464,11 @@ async def _init_attachment(
         # overhead): it reveals approximate size only, no content, and the server
         # needs it for the upload size gate.
         body["relayEnvelope"] = relay_envelope
-        body["relayEncryption"] = RELAY_ENCRYPTION
+        body["relayEncryption"] = relay_envelope.get("relayEncryption") or RELAY_ENCRYPTION
         # MP-10: no top-level relayKeyVersion on a sealed write — the relayEnvelope
-        # carries the authoritative v2 wrap version (server + phone read THAT, never
-        # this body field). The advertised public-key version (1) is a DISTINCT
-        # concept, published only at runtime-status.
+        # carries the authoritative gateway wrap version (server + phone read THAT,
+        # never this body field). The top-level relayEncryption mirrors the envelope
+        # only as a server routing/indexing hint.
         # MP-2: echo the agent's AAD-bound attachment id so the server adopts it
         # (adoptedGatewayDocId) byte-for-byte instead of minting a different id —
         # otherwise the phone rebuilds all three attachment AADs from the server id
@@ -565,11 +629,11 @@ async def _post_message(
             kind=kind,
         )
         body["relayEnvelope"] = envelope
-        body["relayEncryption"] = RELAY_ENCRYPTION
+        body["relayEncryption"] = envelope.get("relayEncryption") or RELAY_ENCRYPTION
         # MP-10: no top-level relayKeyVersion on a sealed write — the relayEnvelope
-        # carries the authoritative v2 wrap version (server + phone read THAT, never
-        # this body field). The advertised public-key version (1) is a DISTINCT
-        # concept, published only at runtime-status.
+        # carries the authoritative gateway wrap version (server + phone read THAT,
+        # never this body field). The top-level relayEncryption mirrors the envelope
+        # only as a server routing/indexing hint.
         # MP-2: echo the agent's AAD-bound message id so the server adopts it
         # (safeIdentifier) byte-for-byte instead of minting a different id —
         # otherwise the phone rebuilds the message AAD from the server id and the
@@ -759,6 +823,48 @@ class _RelaySealer:
             f"BURNBAR_ALLOW_PLAINTEXT=1 to opt into the legacy plaintext relay path."
         )
 
+
+    def _wrap_content_key(
+        self,
+        *,
+        peer: str,
+        key_data: bytes,
+        key_aad: bytes,
+        sender_private,
+        destination_id: str,
+    ) -> dict:
+        """Wrap one content key to ``peer`` and return the version-specific
+        envelope fields (``wrappedKey`` + version markers, plus ``enc`` for v3).
+
+        Chooses RFC 9180 HPKE Auth v3 only when the peer's authenticated
+        capability advertises v3 (:meth:`BurnBarAdapter._peer_relay_key_version_for`);
+        otherwise the byte-stable v2 authenticated 2-DH wrap. In BOTH paths the
+        agent's own static relay key is bound as the authenticated sender, so the
+        phone opens the wrap only against this agent's pinned key. v2 callers get a
+        byte-identical envelope (no ``enc`` field, ``relayKeyVersion`` 2).
+        """
+        version = self._adapter._peer_relay_key_version_for(destination_id)
+        if version >= GATEWAY_RELAY_KEY_VERSION_V3 and RELAY_CRYPTO_AVAILABLE:
+            wrap = relay_e2ee.wrap_symmetric_key_v3(
+                key_data, peer, key_aad, sender_private=sender_private
+            )
+            return {
+                "wrappedKey": wrap.wrapped_key,
+                "enc": wrap.enc,
+                "relayEncryption": wrap.relay_encryption,
+                "relayKeyVersion": wrap.relay_key_version,
+                "senderPublicKey": sender_private.public_key_base64(),
+            }
+        wrapped = relay_e2ee.wrap_symmetric_key(
+            key_data, peer, key_aad, sender_private=sender_private
+        )
+        return {
+            "wrappedKey": wrapped,
+            "relayEncryption": RELAY_ENCRYPTION,
+            "relayKeyVersion": GATEWAY_RELAY_KEY_VERSION,
+            "senderPublicKey": sender_private.public_key_base64(),
+        }
+
     def seal_message(
         self,
         *,
@@ -793,18 +899,14 @@ class _RelaySealer:
             sym,
             _gateway_message_aad(self._uid, self._client_id, message_id),
         )
-        wrapped = relay_e2ee.wrap_symmetric_key(
-            sym, peer, _gateway_message_key_aad(self._uid, self._client_id, message_id),
+        fields = self._wrap_content_key(
+            peer=peer,
+            key_data=sym,
+            key_aad=_gateway_message_key_aad(self._uid, self._client_id, message_id),
             sender_private=sender_private,
+            destination_id=destination_id,
         )
-        return {
-            "payloadCiphertext": payload_ct,
-            "wrappedKey": wrapped,
-            "relayEncryption": RELAY_ENCRYPTION,
-            "relayKeyVersion": GATEWAY_RELAY_KEY_VERSION,
-            "senderPublicKey": sender_private.public_key_base64(),
-            "messageId": message_id,
-        }
+        return {"payloadCiphertext": payload_ct, **fields, "messageId": message_id}
 
     def seal_attachment(
         self, *, destination_id: str, file_path: Path, content_type: str
@@ -839,18 +941,14 @@ class _RelaySealer:
         manifest_ct = relay_e2ee.seal_to_base64(
             manifest, body_key, _gateway_attachment_manifest_aad(self._uid, self._client_id, attachment_id)
         )
-        wrapped = relay_e2ee.wrap_symmetric_key(
-            body_key, peer, _gateway_attachment_key_aad(self._uid, self._client_id, attachment_id),
+        fields = self._wrap_content_key(
+            peer=peer,
+            key_data=body_key,
+            key_aad=_gateway_attachment_key_aad(self._uid, self._client_id, attachment_id),
             sender_private=sender_private,
+            destination_id=destination_id,
         )
-        envelope = {
-            "payloadCiphertext": manifest_ct,
-            "wrappedKey": wrapped,
-            "relayEncryption": RELAY_ENCRYPTION,
-            "relayKeyVersion": GATEWAY_RELAY_KEY_VERSION,
-            "senderPublicKey": sender_private.public_key_base64(),
-            "attachmentId": attachment_id,
-        }
+        envelope = {"payloadCiphertext": manifest_ct, **fields, "attachmentId": attachment_id}
         return envelope, body_bytes
 
     def open_event(self, raw: dict) -> Optional[dict]:
@@ -870,6 +968,9 @@ class _RelaySealer:
                 "payloadCiphertext": raw.get("payloadCiphertext"),
                 "wrappedKey": raw.get("wrappedKey"),
             }
+            for field in ("enc", "relayEncryption", "relayKeyVersion", "senderPublicKey", "eventId"):
+                if raw.get(field) is not None:
+                    envelope[field] = raw.get(field)
         if not isinstance(envelope, dict) or not envelope.get("payloadCiphertext"):
             # Fail-closed: refuse an unsealed (plaintext) event whenever plaintext is
             # forbidden on this link — the SAME predicate the send path uses
@@ -942,15 +1043,14 @@ class _RelaySealer:
             sym,
             payload_aad,
         )
-        wrapped = relay_e2ee.wrap_symmetric_key(sym, peer, key_aad, sender_private=sender_private)
-        return {
-            "payloadCiphertext": payload_ct,
-            "wrappedKey": wrapped,
-            "relayEncryption": RELAY_ENCRYPTION,
-            "relayKeyVersion": GATEWAY_RELAY_KEY_VERSION,
-            "senderPublicKey": sender_private.public_key_base64(),
-            "eventId": event_id,
-        }
+        fields = self._wrap_content_key(
+            peer=peer,
+            key_data=sym,
+            key_aad=key_aad,
+            sender_private=sender_private,
+            destination_id=destination_id,
+        )
+        return {"payloadCiphertext": payload_ct, **fields, "eventId": event_id}
 
     def _open_envelope(self, raw: dict, envelope: dict, private_key, payload_aad_builder, key_aad_builder) -> dict:
         """Unwrap + open one sealed envelope, then pin the peer key (TOFU/immutable).
@@ -985,14 +1085,35 @@ class _RelaySealer:
             version_int = int(version) if version is not None else 0
         except (TypeError, ValueError):
             version_int = 0
-        if version_int != GATEWAY_RELAY_KEY_VERSION or not pinned_phone:
+        # Dispatch v2 (authenticated 2-DH) or v3 (RFC 9180 HPKE Auth) and refuse
+        # everything else: a stripped/forged version, a v1 wrap, or a downgrade to
+        # 1/0 all fail closed here, so plaintext and the anonymous-sender v1 wrap
+        # stay unreachable on a paired link. Both paths bind the PINNED phone key
+        # (never the wire senderPublicKey), so a missing pin is refused too.
+        if not pinned_phone or version_int not in _SUPPORTED_GATEWAY_RELAY_VERSIONS:
             raise _RelayPlaintextRefused(
-                "refusing a non-v2 or unpinned gateway envelope: the authenticated "
+                "refusing a non-v2/v3 or unpinned gateway envelope: the authenticated "
                 "sender pin is required to open"
             )
-        sym = relay_e2ee.unwrap_symmetric_key(
-            envelope["wrappedKey"], private_key, key_aad, sender_public_base64=pinned_phone
-        )
+        if version_int == GATEWAY_RELAY_KEY_VERSION_V3:
+            relay_encryption = envelope.get("relayEncryption", raw.get("relayEncryption"))
+            if relay_encryption != GATEWAY_RELAY_ENCRYPTION_V3:
+                raise _RelayPlaintextRefused(
+                    "refusing a v3 gateway envelope without the HPKE relayEncryption marker"
+                )
+            enc = envelope.get("enc") or raw.get("enc")
+            if not enc:
+                raise _RelayPlaintextRefused(
+                    "refusing a v3 gateway envelope without its HPKE `enc` encapsulated key"
+                )
+            sym = relay_e2ee.unwrap_symmetric_key_v3(
+                enc, envelope["wrappedKey"], private_key, key_aad,
+                pinned_sender_public=pinned_phone,
+            )
+        else:
+            sym = relay_e2ee.unwrap_symmetric_key(
+                envelope["wrappedKey"], private_key, key_aad, sender_public_base64=pinned_phone
+            )
         plaintext = relay_e2ee.open_base64(envelope["payloadCiphertext"], sym, payload_aad)
         # MP-21: the wire senderPublicKey is ADVISORY only. The unwrap above already
         # authenticated this frame against the PINNED phone key, so the carried field
@@ -1046,6 +1167,15 @@ class BurnBarAdapter(BasePlatformAdapter):
         # Seeded from pairing (persisted to ~/.hermes/.env), refreshed from polls.
         self._peer_public_key: Optional[str] = (os.getenv("BURNBAR_RELAY_PEER_PUBLIC_KEY") or "").strip() or None
         self._peer_public_keys: Dict[str, str] = {}
+        # Per-link relay WRAP capability (which key-wrap version to EMIT). Defaults
+        # to the v2 floor; only the authenticated BURNBAR_RELAY_PEER_KEY_VERSION pin
+        # (or a per-destination override seeded at pairing) raises a link to v3,
+        # never the untrusted relay runtime path. Emit-only: the open path is
+        # version-dispatched independently and always binds the pinned sender.
+        self._peer_relay_key_version_default: int = _coerce_peer_relay_key_version(
+            os.getenv(RELAY_PEER_KEY_VERSION_ENV)
+        )
+        self._peer_relay_key_versions: Dict[str, int] = {}
         # Replay defense for the current uid/clientId/pinned-peer tuple. A relay
         # can redeliver a valid sealed event; the AAD binds the id, so the bounded
         # digest cache drops normal duplicates, and the sealed replay counter's
@@ -1465,6 +1595,25 @@ class BurnBarAdapter(BasePlatformAdapter):
         # Deliberately NOT acting on relayCapable/e2eEnabled here: an untrusted
         # runtime response must not flip a never-paired agent into E2E.
 
+
+    def _peer_relay_key_version_for(self, destination_id: str) -> int:
+        """Resolve the relay key-wrap version to EMIT for one destination.
+
+        Returns v3 only when the authenticated capability (the
+        ``BURNBAR_RELAY_PEER_KEY_VERSION`` pin or a per-destination override) says
+        the paired peer supports it; otherwise the v2 floor. A v2-only peer is
+        NEVER auto-upgraded, and an unsupported value floors to v2 — so this only
+        ever selects a wrap version both sides implement. This gates emission
+        only; the open path dispatches on the envelope's own ``relayKeyVersion``
+        and always binds the pinned sender, independent of this value.
+        """
+        version = self._peer_relay_key_versions.get(str(destination_id or ""))
+        if version is None:
+            version = self._peer_relay_key_version_default
+        if version in _SUPPORTED_GATEWAY_RELAY_VERSIONS:
+            return version
+        return GATEWAY_RELAY_KEY_VERSION
+
     async def connect(self) -> bool:
         if not HTTPX_AVAILABLE:
             logger.warning("[%s] httpx is unavailable", self.name)
@@ -1678,6 +1827,9 @@ class BurnBarAdapter(BasePlatformAdapter):
                 body["relayPublicKey"] = pub
                 body["relayEncryption"] = RELAY_ENCRYPTION
                 body["relayKeyVersion"] = RELAY_KEY_VERSION
+                body["gatewayRelayKeyVersion"] = GATEWAY_RELAY_KEY_VERSION_V3
+                body["gatewayRelayEncryption"] = GATEWAY_RELAY_ENCRYPTION_V3
+                body["supportedGatewayRelayKeyVersions"] = list(_SUPPORTED_GATEWAY_RELAY_VERSIONS)
         try:
             response = await self._client.post(
                 f"{self._api_base}/runtime",
@@ -2229,6 +2381,9 @@ def interactive_setup() -> None:
         payload["agentRelayPublicKey"] = agent_relay_public_key
         payload["relayKeyVersion"] = RELAY_KEY_VERSION
         payload["relayEncryption"] = RELAY_ENCRYPTION
+        payload["gatewayRelayKeyVersion"] = GATEWAY_RELAY_KEY_VERSION_V3
+        payload["gatewayRelayEncryption"] = GATEWAY_RELAY_ENCRYPTION_V3
+        payload["supportedGatewayRelayKeyVersions"] = list(_SUPPORTED_GATEWAY_RELAY_VERSIONS)
     try:
         with httpx.Client(timeout=30) as client:
             start = client.post(f"{api_base}/device/start", json=payload)
@@ -2266,6 +2421,7 @@ def interactive_setup() -> None:
     )
     client_payload = approved.get("client") or {}
     relay_capable = approved.get("relayCapable") is True or client_payload.get("relayCapable") is True
+    peer_relay_key_version = _peer_relay_key_version_from_pairing_grant(approved, client_payload)
     client_id = approved.get("clientId") or client_payload.get("id")
     uid = approved.get("uid") or approved.get("userId")
     if agent_relay_public_key and relay_capable and peer_relay_public_key:
@@ -2309,6 +2465,7 @@ def interactive_setup() -> None:
         save_env_value(OVERSIGHT_MODE_ENV, oversight)
         save_env_value(RELAY_E2E_ENV, "1")
         save_env_value("BURNBAR_RELAY_PEER_PUBLIC_KEY", str(peer_relay_public_key))
+        save_env_value(RELAY_PEER_KEY_VERSION_ENV, str(peer_relay_key_version))
         save_env_value("BURNBAR_RELAY_CLIENT_ID", str(client_id))
         save_env_value("BURNBAR_RELAY_UID", str(uid))
         print_success("End-to-end encryption is enabled for this BurnBar link.")

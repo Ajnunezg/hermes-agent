@@ -1035,6 +1035,9 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
         def post(self, url, json=None):
             if url.endswith("/device/start"):
                 assert json["agentRelayPublicKey"] == agent_public_key
+                assert json["relayKeyVersion"] == _burnbar.RELAY_KEY_VERSION
+                assert json["gatewayRelayKeyVersion"] == _burnbar.GATEWAY_RELAY_KEY_VERSION_V3
+                assert json["gatewayRelayEncryption"] == _burnbar.GATEWAY_RELAY_ENCRYPTION_V3
                 return _FakeResponse({"deviceCode": "dev", "userCode": "AB12-CD34", "interval": 0, "verificationUriComplete": "https://example.test"})
             if url.endswith("/device/poll"):
                 return _FakeResponse({
@@ -1043,7 +1046,12 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
                     "homeDestinationId": "burnbar:home",
                     "clientId": "hgw_1",
                     "uid": "uid_1",
-                    "client": {"relayCapable": True, "phoneRelayPublicKey": phone_public_key},
+                    "client": {
+                        "relayCapable": True,
+                        "phoneRelayPublicKey": phone_public_key,
+                        "gatewayRelayKeyVersion": _burnbar.GATEWAY_RELAY_KEY_VERSION_V3,
+                        "gatewayRelayEncryption": _burnbar.GATEWAY_RELAY_ENCRYPTION_V3,
+                    },
                 })
             raise AssertionError(url)
 
@@ -1053,6 +1061,7 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
 
     assert saved[_burnbar.RELAY_E2E_ENV] == "1"
     assert saved["BURNBAR_RELAY_PEER_PUBLIC_KEY"] == phone_public_key
+    assert saved[_burnbar.RELAY_PEER_KEY_VERSION_ENV] == str(_burnbar.GATEWAY_RELAY_KEY_VERSION_V3)
     assert saved["BURNBAR_RELAY_CLIENT_ID"] == "hgw_1"
     assert saved["BURNBAR_RELAY_UID"] == "uid_1"
     assert prompt_defaults == [False]
