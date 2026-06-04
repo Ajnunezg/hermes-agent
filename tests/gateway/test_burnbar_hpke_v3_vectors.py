@@ -8,8 +8,8 @@ This is the vector lane's stop-condition suite. It loads the canonical fixture
   PINNED sender key, and the sealed payload opens to the expected plaintext;
 * inbound event / model_switch payloads carry the strict ``destinationId`` +
   ``replayCounter``/``eventCounter`` schema the production adapter enforces;
-* every negative mutation (forgery, tamper, downgrade, stripped marker) is
-  rejected fail-closed;
+* every negative mutation (forgery, tamper, downgrade, stripped marker, wrong
+  destination, replay rollback) is rejected fail-closed;
 * the fixture metadata is the frozen v3 contract and every authenticated field
   is inspectable;
 * the production ``gateway/crypto/relay_e2ee.py`` HPKE primitives are
@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 from cryptography.exceptions import InvalidTag
 
+from tests.gateway.vectors import generate_burnbar_hpke_v3_vectors as generator
 from tests.gateway.vectors import hpke_v3_reference as ref
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "BurnBarHpkeV3Vector.json"
@@ -48,10 +49,14 @@ REQUIRED_NEGATIVES = {
     "wrong_recipient_key",
     "wrong_key_aad",
     "mutated_enc",
+    "swapped_enc_valid_point",
     "mutated_wrapped_key",
+    "wrong_destination",
+    "replay_counter_rollback",
     "version_changed_to_2",
     "version_changed_to_1",
     "missing_enc",
+    "missing_sender_public_key",
     "missing_relay_encryption",
 }
 # Event-shaped kinds whose opened payload must satisfy the strict inbound schema.
@@ -89,6 +94,12 @@ def test_reference_matches_rfc9180_known_answer_vector():
 def test_reference_self_test_passes():
     """The RFC 9180 reference round-trips and rejects every forgery class."""
     ref.run_self_test()
+
+
+def test_generator_reproduces_checked_in_fixture():
+    """The canonical v3 fixture is byte-reviewable: regeneration yields the same
+    semantic object, so BurnBar/Hermes/Android mirror drift can be diff-gated."""
+    assert generator.build_fixture() == FIXTURE
 
 
 def test_fixture_is_the_frozen_v3_contract():
@@ -190,6 +201,11 @@ def _assert_destination_bound(case, payload: bytes):
 
 @pytest.mark.parametrize("neg", NEGATIVES, ids=[c["name"] for c in NEGATIVES])
 def test_negative_case_is_rejected(neg):
+    if neg.get("policyReject"):
+        with pytest.raises(PayloadPolicyError):
+            _open_negative_policy_payload_and_enforce_gateway_policy(neg)
+        return
+
     base = CASES[neg["derivedFrom"]]
     envelope = _envelope_for(base)
 
@@ -218,10 +234,51 @@ def test_negative_case_is_rejected(neg):
         ref.open_content_key(enc, wrapped, recipient_priv, pinned_sender, key_aad)
 
 
+class PayloadPolicyError(Exception):
+    """A validly opened payload violates gateway policy after authentication."""
+
+
+def _open_negative_policy_payload_and_enforce_gateway_policy(neg):
+    enc, wrapped = ref.parse_strict_v3_envelope(_envelope_for(neg))
+    content_key = ref.open_content_key(
+        enc,
+        wrapped,
+        _b64d(neg["recipientPrivateKeyRaw"]),
+        _b64d(neg["pinnedSenderPublicKeyX963"]),
+        neg["keyAAD"].encode(),
+    )
+    assert content_key == _b64d(neg["plaintextContentKey"])
+    payload = ref.open_payload_base64(
+        neg["payloadCiphertext"], content_key, neg["payloadAAD"].encode()
+    )
+    assert payload.decode("utf-8") == neg["payloadPlaintext"]
+    obj = json.loads(payload.decode("utf-8"))
+
+    policy = neg["policyReject"]
+    if policy == "wrong_destination":
+        expected_dest = neg.get("expectedDestinationId", "burnbar:home")
+        if obj.get("destinationId") != expected_dest:
+            raise PayloadPolicyError(
+                f"{neg['name']}: authenticated destinationId={obj.get('destinationId')!r} "
+                f"does not match expected {expected_dest!r}"
+            )
+    elif policy == "replay_rollback":
+        counters = [obj[k] for k in _REPLAY_KEYS if k in obj]
+        high_water = neg["replayHighWater"]
+        if any(isinstance(c, int) and c <= high_water for c in counters):
+            raise PayloadPolicyError(
+                f"{neg['name']}: authenticated replay counter {counters!r} "
+                f"is not above high-water {high_water}"
+            )
+    else:  # pragma: no cover - generator contract guard
+        raise AssertionError(f"unknown payload policy reject kind: {policy}")
+
+
 _EXPECTED_ERROR = {
     "InvalidTag": InvalidTag,
     "HpkeError": ref.HpkeError,
     "RelayV3EnvelopeError": ref.RelayV3EnvelopeError,
+    "PayloadPolicyError": PayloadPolicyError,
 }
 
 

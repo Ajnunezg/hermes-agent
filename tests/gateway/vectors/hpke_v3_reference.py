@@ -310,12 +310,21 @@ def open_content_key(
 # ---------------------------------------------------------------------------
 
 
-def seal_payload_base64(plaintext: bytes, content_key: bytes, aad: bytes) -> str:
+def seal_payload_base64(
+    plaintext: bytes,
+    content_key: bytes,
+    aad: bytes,
+    *,
+    nonce: bytes | None = None,
+) -> str:
     import os
 
     if len(content_key) != _NK:
         raise HpkeError("content key must be 32 bytes")
-    nonce = os.urandom(_NN)
+    if nonce is None:
+        nonce = os.urandom(_NN)
+    if len(nonce) != _NN:
+        raise HpkeError("payload nonce must be 12 bytes")
     return base64.b64encode(nonce + AESGCM(content_key).encrypt(nonce, plaintext, aad)).decode(
         "ascii"
     )
@@ -351,7 +360,10 @@ def parse_strict_v3_envelope(envelope: dict) -> tuple[str, str]:
     """Return ``(enc, wrappedKey)`` iff ``envelope`` would be admitted to the v3
     HPKE opener, else raise. A frame that is not marked ``relayKeyVersion == 3``,
     lacks the HPKE ``relayEncryption`` marker, or is missing ``enc``/``wrappedKey``
-    is not a v3 frame and is refused here — the v3 opener never runs on it."""
+    lacks the HPKE ``relayEncryption`` marker, is missing ``enc``/``wrappedKey``,
+    or omits the diagnostic/authenticated-sender field required by the gateway
+    relay schema is not a v3 frame and is refused here — the v3 opener never
+    runs on it."""
     version = envelope.get("relayKeyVersion")
     if version != RELAY_KEY_VERSION_V3:  # exact int 3; "2"/"1"/None all reject
         raise RelayV3EnvelopeError(
@@ -369,6 +381,9 @@ def parse_strict_v3_envelope(envelope: dict) -> tuple[str, str]:
         raise RelayV3EnvelopeError("sealed v3 frame is missing the HPKE 'enc' field")
     if not isinstance(wrapped, str) or not wrapped:
         raise RelayV3EnvelopeError("sealed v3 frame is missing the 'wrappedKey' field")
+    sender_public = envelope.get("senderPublicKey")
+    if not isinstance(sender_public, str) or not sender_public:
+        raise RelayV3EnvelopeError("sealed v3 frame is missing the 'senderPublicKey' field")
     return enc, wrapped
 
 

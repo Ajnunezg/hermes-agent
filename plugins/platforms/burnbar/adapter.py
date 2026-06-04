@@ -89,6 +89,7 @@ OVERSIGHT_REFRESH_SECONDS = 15.0
 # Bound on the replay-defense seen-event-id cache (oldest ids evicted first).
 MAX_SEEN_EVENT_IDS = 4096
 MAX_MALFORMED_SEALED_EVENT_FINGERPRINTS = 512
+MAX_MALFORMED_SEALED_EVENT_FAILURES_PER_WINDOW = 64
 MALFORMED_SEALED_EVENT_THROTTLE_SECONDS = 60.0
 # Persisted replay ledger (survives gateway restart). Buckets are bound to
 # uid/clientId plus the pinned peer-key fingerprint; entries store opaque
@@ -1906,6 +1907,7 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._seen_event_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
         self._event_replay_high_water = -1
         self._malformed_sealed_event_failures: "collections.OrderedDict[str, float]" = collections.OrderedDict()
+        self._malformed_sealed_event_failure_times: "collections.deque[float]" = collections.deque()
         # E2E negotiated at pairing (server reports the link relay-capable).
         self._relay_e2e_enabled = (os.getenv(RELAY_E2E_ENV) or "").strip() == "1"
         self._agent_ratchet_prekey_bundle: Optional[dict[str, Any]] = None
@@ -2333,28 +2335,39 @@ class BurnBarAdapter(BasePlatformAdapter):
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-    def _drop_throttled_malformed_sealed_event(self, raw: dict) -> bool:
-        if not self._relay_e2e_enabled:
-            return False
-        now = time.monotonic()
+    def _prune_malformed_sealed_event_failures(self, now: float) -> None:
         expired = [
             key for key, seen_at in self._malformed_sealed_event_failures.items()
             if now - seen_at > MALFORMED_SEALED_EVENT_THROTTLE_SECONDS
         ]
         for key in expired:
             self._malformed_sealed_event_failures.pop(key, None)
+        while (
+            self._malformed_sealed_event_failure_times
+            and now - self._malformed_sealed_event_failure_times[0] > MALFORMED_SEALED_EVENT_THROTTLE_SECONDS
+        ):
+            self._malformed_sealed_event_failure_times.popleft()
+
+    def _drop_throttled_malformed_sealed_event(self, raw: dict) -> bool:
+        if not self._relay_e2e_enabled:
+            return False
+        now = time.monotonic()
+        self._prune_malformed_sealed_event_failures(now)
         key = self._sealed_event_failure_fingerprint(raw)
         seen_at = self._malformed_sealed_event_failures.get(key)
-        if seen_at is None:
-            return False
-        self._malformed_sealed_event_failures.move_to_end(key)
-        return True
+        if seen_at is not None:
+            self._malformed_sealed_event_failures.move_to_end(key)
+            return True
+        return len(self._malformed_sealed_event_failure_times) >= MAX_MALFORMED_SEALED_EVENT_FAILURES_PER_WINDOW
 
     def _record_malformed_sealed_event_failure(self, raw: dict) -> None:
         if not self._relay_e2e_enabled:
             return
+        now = time.monotonic()
+        self._prune_malformed_sealed_event_failures(now)
+        self._malformed_sealed_event_failure_times.append(now)
         key = self._sealed_event_failure_fingerprint(raw)
-        self._malformed_sealed_event_failures[key] = time.monotonic()
+        self._malformed_sealed_event_failures[key] = now
         self._malformed_sealed_event_failures.move_to_end(key)
         while len(self._malformed_sealed_event_failures) > MAX_MALFORMED_SEALED_EVENT_FINGERPRINTS:
             self._malformed_sealed_event_failures.popitem(last=False)
@@ -2552,7 +2565,7 @@ class BurnBarAdapter(BasePlatformAdapter):
         model_switch_applied = False
         destination_id = str(raw.get("destinationId") or self._home_channel)
         if self._drop_throttled_malformed_sealed_event(raw):
-            logger.info("[%s] throttled repeated malformed sealed event", self.name)
+            logger.info("[%s] throttled malformed sealed event", self.name)
             return
         try:
             authed = self._sealer.open_event(raw)
@@ -2594,7 +2607,7 @@ class BurnBarAdapter(BasePlatformAdapter):
                     return
                 self._handle_sealed_oversight_mode(authed)
                 return
-            if kind == "model_switch" or authed.get("modelId") is not None:
+            if kind == "model_switch":
                 model_id = str(authed.get("modelId") or "").strip()
                 if not _is_safe_model_id(model_id):
                     logger.warning("[%s] dropped model_switch with unsafe modelId %r", self.name, model_id)

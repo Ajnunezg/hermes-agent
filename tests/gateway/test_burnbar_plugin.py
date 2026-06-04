@@ -1945,6 +1945,50 @@ async def test_repeated_malformed_sealed_event_is_throttled_by_frame_fingerprint
 
 @requires_relay
 @pytest.mark.asyncio
+async def test_unique_malformed_sealed_events_are_rate_limited(monkeypatch, tmp_path):
+    """Unique malformed sealed frames hit a bounded failure budget before another
+    unwrap attempt, closing the forged-ciphertext flood gap that fingerprint
+    duplicate suppression alone cannot cover."""
+    monkeypatch.setattr(_burnbar, "MAX_MALFORMED_SEALED_EVENT_FAILURES_PER_WINDOW", 2)
+    phone_priv = relay_e2ee.generate_private_key()
+    adapter, _agent = _e2e_adapter(
+        monkeypatch, tmp_path, peer_public_key=phone_priv.public_key_base64()
+    )
+    original_open_event = adapter._sealer.open_event
+    open_attempts = []
+
+    def open_event(raw):
+        envelope = raw.get("relayEnvelope") if isinstance(raw.get("relayEnvelope"), dict) else {}
+        if str(envelope.get("payloadCiphertext") or "").startswith("not-base64"):
+            open_attempts.append(raw.get("id"))
+            raise ValueError("bad ciphertext")
+        return original_open_event(raw)
+
+    monkeypatch.setattr(adapter._sealer, "open_event", open_event)
+
+    for i in range(3):
+        await adapter._handle_burnbar_event(
+            {
+                "id": f"evt_malformed_unique_{i}",
+                "destinationId": "burnbar:home",
+                "relayEnvelope": {
+                    "eventId": f"evt_malformed_unique_{i}",
+                    "payloadCiphertext": f"not-base64-{i}!",
+                    "wrappedKey": f"also-bad-{i}!",
+                    "senderPublicKey": phone_priv.public_key_base64(),
+                    "relayEncryption": _burnbar.RELAY_ENCRYPTION,
+                    "relayKeyVersion": _burnbar.GATEWAY_RELAY_KEY_VERSION,
+                },
+            }
+        )
+
+    assert open_attempts == ["evt_malformed_unique_0", "evt_malformed_unique_1"]
+    assert len(adapter._malformed_sealed_event_failure_times) == 2
+    assert adapter._event_replay_key("evt_malformed_unique_2") not in adapter._seen_event_ids
+
+
+@requires_relay
+@pytest.mark.asyncio
 async def test_mp3_failed_open_does_not_record_event_id(monkeypatch, tmp_path):
     """MP-3: an event that fails to authenticate must NOT record its id, so a forged-
     id flood (all failing AEAD) cannot evict a genuine pending id from the cache."""
@@ -2633,6 +2677,37 @@ async def test_relay_top_level_model_switch_spoof_cannot_override_sealed_chat(mo
                 "senderPublicKey": phone_pub,
             },
         }
+    )
+
+    assert len(received) == 1
+    assert received[0].text == "normal chat"
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_sealed_model_id_without_model_switch_kind_stays_chat(monkeypatch, tmp_path):
+    """A modelId is only a control command when the authenticated sealed kind says
+    model_switch; a naked modelId inside chat JSON is treated as ordinary payload."""
+    phone_priv = relay_e2ee.generate_private_key()
+    adapter, _agent = _e2e_adapter(
+        monkeypatch, tmp_path, peer_public_key=phone_priv.public_key_base64()
+    )
+    adapter._publish_runtime_status = lambda *a, **k: pytest.fail("model switch side effect should not run")
+    received = []
+    adapter.handle_message = lambda e: received.append(e) or _noop()
+
+    await adapter._handle_burnbar_event(
+        _phone_sealed_event(
+            adapter,
+            phone_priv,
+            "evt_modelid_chat",
+            {
+                "text": "normal chat",
+                "modelId": "anthropic/claude",
+                "destinationId": "burnbar:home",
+                "replayCounter": 1,
+            },
+        )
     )
 
     assert len(received) == 1

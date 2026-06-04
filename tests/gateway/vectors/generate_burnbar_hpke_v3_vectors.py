@@ -5,30 +5,24 @@ Run (writes ``tests/gateway/fixtures/BurnBarHpkeV3Vector.json``)::
     cd /Users/albertonunez/.hermes/hermes-agent
     venv/bin/python -m tests.gateway.vectors.generate_burnbar_hpke_v3_vectors
 
-The vectors are *open-verification* vectors (RFC 9180 vectors with a random
-ephemeral are not byte-reproducible, so the proof is "a different implementation
-opens these bytes", not "reproduces these bytes"): the static recipient/sender
-keypairs and per-case content keys are deterministic (so a reviewer sees stable
-key material and the keys line up with the Swift deterministic fixture), while
-each HPKE ``enc`` uses a fresh random ephemeral exactly as production does.
-Regenerating therefore yields a fresh *valid* fixture, not identical bytes — the
-verifier opens it rather than diffing it.
+The vectors are byte-reproducible review fixtures: static recipient/sender
+keypairs, per-case content keys, HPKE Auth ephemerals, and payload AES-GCM nonces
+are all deterministic. Production still uses fresh random HPKE ephemerals and
+payload nonces; determinism here exists only so BurnBar, Hermes, and Android can
+share one exact fixture hash and reviewers can regenerate it locally.
 
-Coordination: this is the test-lane canonical source. When the Swift/Kotlin v3
-generators land they become the preferred emitters (a Swift-emitted fixture
-proves the phone and agent agree on bytes); this Python-reference fixture is the
-handoff until then and the permanent independent cross-check. Do NOT silently
-overwrite vendored Swift/Android copies — re-vendor through the owners.
+Coordination: this is the canonical v3 fixture source. Regenerate it once, then
+mirror the exact JSON bytes into BurnBar Core and Android test resources. The
+remediation verifier fails if those three copies drift.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 from pathlib import Path
-
-from cryptography.hazmat.primitives.asymmetric import ec
 
 from tests.gateway.vectors import hpke_v3_reference as ref
 
@@ -73,12 +67,34 @@ _AGENT_PUB = _public_x963(_AGENT_PRIV)
 _PHONE_PUB = _public_x963(_PHONE_PRIV)
 
 
-def _wrap(content_key: bytes, recipient_pub: bytes, sender_priv: bytes, key_aad: str):
-    return ref.wrap_content_key(content_key, recipient_pub, sender_priv, key_aad.encode())
+def _wrap(
+    content_key: bytes,
+    recipient_pub: bytes,
+    sender_priv: bytes,
+    key_aad: str,
+    *,
+    ephemeral_tweak: int,
+):
+    return ref.wrap_content_key(
+        content_key,
+        recipient_pub,
+        sender_priv,
+        key_aad.encode(),
+        ephemeral_private=ref.private_from_raw(_deterministic_private_raw(ephemeral_tweak)),
+    )
 
 
-def _seal_payload(plaintext: str, content_key: bytes, payload_aad: str) -> str:
-    return ref.seal_payload_base64(plaintext.encode(), content_key, payload_aad.encode())
+def _payload_nonce(name: str) -> bytes:
+    return hashlib.sha256(f"BurnBarHpkeV3PayloadNonce|{name}".encode("utf-8")).digest()[:12]
+
+
+def _seal_payload(name: str, plaintext: str, content_key: bytes, payload_aad: str) -> str:
+    return ref.seal_payload_base64(
+        plaintext.encode(),
+        content_key,
+        payload_aad.encode(),
+        nonce=_payload_nonce(name),
+    )
 
 
 def _positive_case(
@@ -120,7 +136,7 @@ def _positive_case(
         "wrappedKey": wrapped_b64,
         "plaintextContentKey": _b64(content_key),
         "payloadAAD": payload_aad,
-        "payloadCiphertext": _seal_payload(payload_plaintext, content_key, payload_aad),
+        "payloadCiphertext": _seal_payload(name, payload_plaintext, content_key, payload_aad),
         "payloadPlaintext": payload_plaintext,
         "relayKeyVersion": ref.RELAY_KEY_VERSION_V3,
         "relayEncryption": ref.RELAY_ENCRYPTION_V3,
@@ -134,7 +150,11 @@ def _build_positive_cases() -> list[dict]:
     event_id = "e-hpke-v3"
     event_key = _deterministic_content_key(0x11)
     e_enc, e_wrapped = _wrap(
-        event_key, _AGENT_PUB, _PHONE_PRIV, _aad("gatewayEventKey", _UID, _CLIENT_ID, event_id)
+        event_key,
+        _AGENT_PUB,
+        _PHONE_PRIV,
+        _aad("gatewayEventKey", _UID, _CLIENT_ID, event_id),
+        ephemeral_tweak=0xE1,
     )
     cases.append(
         _positive_case(
@@ -163,7 +183,11 @@ def _build_positive_cases() -> list[dict]:
     ms_id = "e-model-switch-v3"
     ms_key = _deterministic_content_key(0x33)
     ms_enc, ms_wrapped = _wrap(
-        ms_key, _AGENT_PUB, _PHONE_PRIV, _aad("gatewayEventKey", _UID, _CLIENT_ID, ms_id)
+        ms_key,
+        _AGENT_PUB,
+        _PHONE_PRIV,
+        _aad("gatewayEventKey", _UID, _CLIENT_ID, ms_id),
+        ephemeral_tweak=0xE2,
     )
     cases.append(
         _positive_case(
@@ -192,7 +216,11 @@ def _build_positive_cases() -> list[dict]:
     message_id = "m-hpke-v3"
     msg_key = _deterministic_content_key(0x22)
     m_enc, m_wrapped = _wrap(
-        msg_key, _PHONE_PUB, _AGENT_PRIV, _aad("gatewayMessageKey", _UID, _CLIENT_ID, message_id)
+        msg_key,
+        _PHONE_PUB,
+        _AGENT_PRIV,
+        _aad("gatewayMessageKey", _UID, _CLIENT_ID, message_id),
+        ephemeral_tweak=0xE3,
     )
     cases.append(
         _positive_case(
@@ -224,7 +252,13 @@ def _build_positive_cases() -> list[dict]:
     attachment_id = "a-hpke-v3"
     body_key = _deterministic_content_key(0x44)
     a_key_aad = _aad("gatewayAttachmentKey", _UID, _CLIENT_ID, attachment_id)
-    a_enc, a_wrapped = _wrap(body_key, _PHONE_PUB, _AGENT_PRIV, a_key_aad)
+    a_enc, a_wrapped = _wrap(
+        body_key,
+        _PHONE_PUB,
+        _AGENT_PRIV,
+        a_key_aad,
+        ephemeral_tweak=0xE4,
+    )
     cases.append(
         _positive_case(
             name="agent_reply_attachment_manifest",
@@ -285,7 +319,33 @@ def _build_negative_cases(positives: list[dict]) -> list[dict]:
     # A VALID but wrong ephemeral point (on-curve) -> AuthDecap derives a wrong
     # shared secret -> AEAD InvalidTag (distinct from the off-curve mutated_enc,
     # which is rejected earlier at point validation).
-    swapped_enc = _b64(ref.serialize_public(ec.generate_private_key(ec.SECP256R1()).public_key()))
+    swapped_enc = _b64(
+        ref.serialize_public(ref.private_from_raw(_deterministic_private_raw(0xE5)).public_key())
+    )
+
+    wrong_destination_id = "e-wrong-destination-v3"
+    wrong_destination_key = _deterministic_content_key(0x55)
+    wrong_destination_key_aad = _aad("gatewayEventKey", _UID, _CLIENT_ID, wrong_destination_id)
+    wrong_destination_payload_aad = _aad("gatewayEvent", _UID, _CLIENT_ID, wrong_destination_id)
+    wrong_destination_enc, wrong_destination_wrapped = _wrap(
+        wrong_destination_key,
+        _AGENT_PUB,
+        _PHONE_PRIV,
+        wrong_destination_key_aad,
+        ephemeral_tweak=0xE6,
+    )
+
+    replay_rollback_id = "e-replay-rollback-v3"
+    replay_rollback_key = _deterministic_content_key(0x66)
+    replay_rollback_key_aad = _aad("gatewayEventKey", _UID, _CLIENT_ID, replay_rollback_id)
+    replay_rollback_payload_aad = _aad("gatewayEvent", _UID, _CLIENT_ID, replay_rollback_id)
+    replay_rollback_enc, replay_rollback_wrapped = _wrap(
+        replay_rollback_key,
+        _AGENT_PUB,
+        _PHONE_PRIV,
+        replay_rollback_key_aad,
+        ephemeral_tweak=0xE7,
+    )
 
     # ``expectedError`` is the reference v3-admission path's exact exception, so the
     # verifier asserts a tight per-negative type (never a broad ValueError that a
@@ -353,6 +413,94 @@ def _build_negative_cases(positives: list[dict]) -> list[dict]:
             "wrappedKeyOverride": _flip_b64_byte(base["wrappedKey"], 0),
         },
         {
+            "name": "wrong_destination",
+            "derivedFrom": base["name"],
+            "kind": "event",
+            "direction": "phone_to_agent",
+            "mutation": "authenticated_payload_destination",
+            "expected": "reject",
+            "expectedError": "PayloadPolicyError",
+            "policyReject": "wrong_destination",
+            "detail": (
+                "The HPKE wrap and payload AEAD open, but the authenticated JSON "
+                "destinationId is not the expected gateway destination -> the "
+                "adapter must reject before dispatch."
+            ),
+            "uid": _UID,
+            "clientId": _CLIENT_ID,
+            "eventId": wrong_destination_id,
+            "recipientPrivateKeyRaw": _b64(_AGENT_PRIV),
+            "recipientPublicKeyX963": _b64(_AGENT_PUB),
+            "pinnedSenderPublicKeyX963": _b64(_PHONE_PUB),
+            "senderPublicKeyX963": _b64(_PHONE_PUB),
+            "keyAAD": wrong_destination_key_aad,
+            "info": ref.info_for(wrong_destination_key_aad.encode()).decode(),
+            "enc": wrong_destination_enc,
+            "wrappedKey": wrong_destination_wrapped,
+            "plaintextContentKey": _b64(wrong_destination_key),
+            "payloadAAD": wrong_destination_payload_aad,
+            "payloadCiphertext": _seal_payload(
+                "wrong_destination",
+                (
+                    '{"text":"wrong destination","kind":"chat",'
+                    '"destinationId":"burnbar:other","replayCounter":3}'
+                ),
+                wrong_destination_key,
+                wrong_destination_payload_aad,
+            ),
+            "payloadPlaintext": (
+                '{"text":"wrong destination","kind":"chat",'
+                '"destinationId":"burnbar:other","replayCounter":3}'
+            ),
+            "expectedDestinationId": "burnbar:home",
+            "relayKeyVersion": ref.RELAY_KEY_VERSION_V3,
+            "relayEncryption": ref.RELAY_ENCRYPTION_V3,
+        },
+        {
+            "name": "replay_counter_rollback",
+            "derivedFrom": "phone_event_model_switch",
+            "kind": "event",
+            "direction": "phone_to_agent",
+            "mutation": "authenticated_replay_counter_rollback",
+            "expected": "reject",
+            "expectedError": "PayloadPolicyError",
+            "policyReject": "replay_rollback",
+            "detail": (
+                "The HPKE wrap and payload AEAD open, but authenticated replayCounter=1 "
+                "is at or below the prior high-water=2 for this paired client -> reject "
+                "before dispatch even with a fresh event id."
+            ),
+            "uid": _UID,
+            "clientId": _CLIENT_ID,
+            "eventId": replay_rollback_id,
+            "recipientPrivateKeyRaw": _b64(_AGENT_PRIV),
+            "recipientPublicKeyX963": _b64(_AGENT_PUB),
+            "pinnedSenderPublicKeyX963": _b64(_PHONE_PUB),
+            "senderPublicKeyX963": _b64(_PHONE_PUB),
+            "keyAAD": replay_rollback_key_aad,
+            "info": ref.info_for(replay_rollback_key_aad.encode()).decode(),
+            "enc": replay_rollback_enc,
+            "wrappedKey": replay_rollback_wrapped,
+            "plaintextContentKey": _b64(replay_rollback_key),
+            "payloadAAD": replay_rollback_payload_aad,
+            "payloadCiphertext": _seal_payload(
+                "replay_counter_rollback",
+                (
+                    '{"kind":"model_switch","modelId":"claude-opus-4-8",'
+                    '"destinationId":"burnbar:home","replayCounter":1}'
+                ),
+                replay_rollback_key,
+                replay_rollback_payload_aad,
+            ),
+            "payloadPlaintext": (
+                '{"kind":"model_switch","modelId":"claude-opus-4-8",'
+                '"destinationId":"burnbar:home","replayCounter":1}'
+            ),
+            "replayHighWater": 2,
+            "relayKeyVersion": ref.RELAY_KEY_VERSION_V3,
+            "relayEncryption": ref.RELAY_ENCRYPTION_V3,
+        },
+        {
             "name": "version_changed_to_2",
             "derivedFrom": base["name"],
             "mutation": "relay_key_version",
@@ -384,6 +532,15 @@ def _build_negative_cases(positives: list[dict]) -> list[dict]:
             "expectedError": "RelayV3EnvelopeError",
             "detail": "A sealed v3 frame without the HPKE 'enc' field is structurally invalid -> fail closed.",
             "dropField": "enc",
+        },
+        {
+            "name": "missing_sender_public_key",
+            "derivedFrom": base["name"],
+            "mutation": "missing_field",
+            "expected": "reject",
+            "expectedError": "RelayV3EnvelopeError",
+            "detail": "A sealed v3 gateway frame without senderPublicKey violates the shared relay schema -> fail closed.",
+            "dropField": "senderPublicKey",
         },
         {
             "name": "missing_relay_encryption",
@@ -429,9 +586,10 @@ def build_fixture() -> dict:
             "note": (
                 "Python RFC 9180 reference (test-lane canonical, byte-identical to "
                 "gateway/crypto/relay_e2ee.py HPKE primitives). Static keys + content "
-                "keys deterministic; HPKE ephemerals random. Canonical fixture owner: "
-                "Hermes gateway vector lane; re-vendor copies into BurnBar Android and "
-                "any Swift fixture from this generator when the v3 contract changes."
+                "keys, HPKE ephemerals, and payload nonces are deterministic so the "
+                "fixture hash is stable across Hermes, BurnBar Core, and Android. "
+                "Production uses fresh random ephemerals/nonces; this determinism is "
+                "test-only."
             ),
         },
         "keys": {
