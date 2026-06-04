@@ -3,7 +3,7 @@
     {
       "clientId": "c-hpke-v3",
       "direction": "phone_to_agent",
-      "enc": "BBysJZbliFifrpWscIN/UJAjTt5d4hhSX1zL0eRDpwPiV64J3SnBufQ7NQP2+YhW3sq99/2Pv6mT87DWK4z6l90=",
+      "enc": "BIPN5IZxNHwyQWazLsJkVH93ZWKyhSn+jrj/Eaj8sr9GQ7O+oU8VGrgQhQfSEEc7jtjuFC0vmVjL4kp8mL21evE=",
       "eventId": "e-hpke-v3",
       "expected": "open",
       "info": "OpenBurnBar-HermesRelay-HPKE-v3|OpenBurnBar-HermesRelay-v1|gatewayEventKey|u-hpke-v3|c-hpke-v3|e-hpke-v3",
@@ -11,7 +11,7 @@
       "kind": "event",
       "name": "phone_event_text",
       "payloadAAD": "OpenBurnBar-HermesRelay-v1|gatewayEvent|u-hpke-v3|c-hpke-v3|e-hpke-v3",
-      "payloadCiphertext": "pgTNX4MVJ2MXcu2FcfljisGnVzu15gwczuA4x4Gk9madhDGxxN8ohwyOHp0sWDzNJt5f8ZOZfT72uxk26faWZLjYsmIhq9NYEJ7LAz9kCNkBBwoaNn37r9nvcOGAr6mNPC9ZNbUewRb+ECg0Aavw6/QPPaNgOVCBgGj6K6Ow",
+      "payloadCiphertext": "YgcIvMPtj49jIccORCtiDkqMfTWunpmraDTvkcufB7DyPHyqRBmMH4hRF+ayvYAJxTlpjpNX+IflkvLqi4xWWQzXnc7rRKiM8ZsurM6PVd86he0Oa7Ta3vQs5j7tBFPS/tz8vfAm0g0CfIWzh3EiZ0tIUOAM/cWLvNfb/NiM",
       "payloadPlaintext": "{\"text\":\"open the BurnBar gateway\",\"kind\":\"chat\",\"destinationId\":\"burnbar:home\",\"replayCounter\":1}",
       "pinnedSenderPublicKeyX963": "BEKv7RhS+Y6na81bmkM5tzyhuY2lqIAoclDXgUMlOxYGgIa3AgfJHKxRBUYttVjR/+p9mm94EPDWHQpMU175cwE=",
       "plaintextContentKey": "ERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc4+o=",
@@ -21,12 +21,12 @@
       "relayKeyVersion": 3,
       "senderPublicKeyX963": "BEKv7RhS+Y6na81bmkM5tzyhuY2lqIAoclDXgUMlOxYGgIa3AgfJHKxRBUYttVjR/+p9mm94EPDWHQpMU175cwE=",
       "uid": "u-hpke-v3",
-      "wrappedKey": "5U1NgRDu2WHwV2QIiAtOPDR/2ba8lEJamYi12ML76Sh97OkiTRSG37jcbrOnVSLv"
+      "wrappedKey": "nkWs90rGrWdBJKWqzVLuE9t9EQtu9cS7Z0GS2OL1faruGfau0AzS5bbDPrP9XY1y"
     },
     {
       "clientId": "c-hpke-v3",
       "direction": "phone_to_agent",
-      "enc": "BHlMrJei1OMmaCt7Hk2AodtaQRFmfKz8L22ZLsqh4dNyrYAHHqBcqhH2G7fziz1+C1Qn+Rqkhz1w1XfFhbuh9eI=",
+      "enc": "BIlGdb0VSQIUBzhB4KoJCdxv8Xd1EoGzmgz6HFeLivC191U65STuP5OJcNHARGYLK87i2jjS+F6pPEQu3Kkn/v8=",
       "eventId": "e-model-switch-v3",
       "expected": "open",
       "info": "OpenBurnBar-HermesRelay-HPKE-v3|OpenBurnBar-HermesRelay-v1|gatewayEventKey|u-hpke-v3|c-hpke-v3|e-model-switch-v3",
@@ -34,7 +34,7 @@
       "kind": "model_switch",
       "name": "phone_event_model_switch",
       "payloadAAD": "OpenBurnBar-HermesRelay-v1|gatewayEvent|u-hpke-v3|c-hpke-v3|e-model-switch-v3",
-      "payloadCiphertext": "/Ecp9uMQfPRkU1wTMolxIcf5N/55Te4Udipt6iXAdvrc8TZ6cFWfbQ4e16rvqvJvuhV90eaLDwLA7+PAdGQn+Ey9oAUlTbGC4olB0rheK+KZlb/dtmVgE0475yV0Acx7YNKI0dB7nsW/i/vaYFKFj8pgXTuFSAdd3xohvq0uLUM=",
+      "payloadCiphertext": "Y3V8/iX7xyjqWoKZEBFdzwQwUqKNBIvQ2AyAyzsCvuH/UemeS2j0lwDJlcFVBmQi3GBUwysO/HFDjc3dd6Zqzb7p1Yrhr3/W6YdDBv2y3c1BfPW5Jdx5bObi6FNergQ+nevMxy9Cfn//1B1gJR4DqB3eaWfYGfDC4ZQwnbYYzRs=",
       "payloadPlaintext": "{\"kind\":\"model_switch\",\"modelId\":\"claude-opus-4-8\",\"destinationId\":\"burnbar:home\",\"replayCounter\":2}",
       "pinnedSenderPublicKeyX963": "BEKv7RhS+Y6na81bmkM5tzyhuY2lqIAoclDXgUMlOxYGgIa3AgfJHKxRBUYttVjR/+p9mm94EPDWHQpMU175cwE=",
       "plaintextContentKey": "MzpBSE9WXWRrcnmAh46VnKOqsbi/xs3U2+Lp8PcDChE=",
@@ -44,12 +44,12 @@
       "relayKeyVersion": 3,
       "senderPublicKeyX963": "BEKv7RhS+Y6na81bmkM5tzyhuY2lqIAoclDXgUMlOxYGgIa3AgfJHKxRBUYttVjR/+p9mm94EPDWHQpMU175cwE=",
       "uid": "u-hpke-v3",
-      "wrappedKey": "qV3uXd8f3Iq6hpo9vzj8fuV4wg8QCOsH7YNOA6tbMqx8qLdxTk0j/lzdGsgICbJj"
+      "wrappedKey": "sn+G8hdBG8kgBQ74ZGKIzy+tAArZgwuUvGft4j+Nr0eLkXcWYp1AEeDGDJSDo9OG"
     },
     {
       "clientId": "c-hpke-v3",
       "direction": "agent_to_phone",
-      "enc": "BC2inutw0rICJqGQuzAcVFKZKIcmZsaQ3FDbKVrXld6d4QPDzSrF0bUnvZ6LgltGgkqVYP4n3mmbRRRFuAq9TJs=",
+      "enc": "BIVI9LgRE6ulHxh5sjo40VLDuGsJgd0OR4GsLVQsI/p2OIWZUoNA7izPILtOd4is6GiL6RGvt7vNujVRLVd0Dec=",
       "expected": "open",
       "info": "OpenBurnBar-HermesRelay-HPKE-v3|OpenBurnBar-HermesRelay-v1|gatewayMessageKey|u-hpke-v3|c-hpke-v3|m-hpke-v3",
       "keyAAD": "OpenBurnBar-HermesRelay-v1|gatewayMessageKey|u-hpke-v3|c-hpke-v3|m-hpke-v3",
@@ -57,8 +57,8 @@
       "messageId": "m-hpke-v3",
       "name": "agent_reply_text",
       "payloadAAD": "OpenBurnBar-HermesRelay-v1|gatewayMessage|u-hpke-v3|c-hpke-v3|m-hpke-v3",
-      "payloadCiphertext": "OlTHqgMxBMP476PJiElW3RD70iGs7pSJMrlg47u4w+5wZwyehOGGL2b3a0t4I0kr0NScGo7ebNExP6hRZs2zvR4Jg7EtTyrCzDNN7q3wjTel",
-      "payloadPlaintext": "{\"text\":\"Hermes replied over the encrypted gateway.\"}",
+      "payloadCiphertext": "YrtVOogUh5XIRelCFJOrBqIoapeeEtHWZAlDkw1bVdU51D6Q7x4KGl7jVaQSeGdCqHyuGqrNc6UFWgVeXebrFfUrn/mcUbkRw9HM0rq11QqkO1x1ve1f8arouKWdbN8LZK2wmxhNdqaqxliT2TZYzw==",
+      "payloadPlaintext": "{\"text\":\"Hermes replied over the encrypted gateway.\",\"destinationId\":\"burnbar:home\"}",
       "pinnedSenderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "plaintextContentKey": "IikwNz5FTFNaYWhvdn2Ei5KZoKeutbzDytHY3+bt9AA=",
       "recipientPrivateKeyRaw": "EEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgI=",
@@ -67,21 +67,21 @@
       "relayKeyVersion": 3,
       "senderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "uid": "u-hpke-v3",
-      "wrappedKey": "WwCvqaPzujozrZw6JmAWCSDmkoCDg+CJYXIuWiL4AHcX1+00AgKtN8XekZuYicU2"
+      "wrappedKey": "mZQIoDR52JxZj7nLYBpeePWxC0ZvJbbakuVg0/zcjBMsXfs6YCPtTljjCTUyPu9L"
     },
     {
       "attachmentId": "a-hpke-v3",
       "clientId": "c-hpke-v3",
       "direction": "agent_to_phone",
-      "enc": "BKjfGOruS0+zk9k1bmdTs1kwGkT0C5TWpjGUyZKoJ6Wax4SJvk9GxtCfU4qFhb8v7v4omQUwSi/eO1hmlheJYEk=",
+      "enc": "BEGq0KE8PIW0GlIAcPxAfYc8y+kv64f/c3ZC/0dGl3pdTCpZMlRBfRTmTZ8uHgbZkuL3miruOknVppq28XfAHbY=",
       "expected": "open",
       "info": "OpenBurnBar-HermesRelay-HPKE-v3|OpenBurnBar-HermesRelay-v1|gatewayAttachmentKey|u-hpke-v3|c-hpke-v3|a-hpke-v3",
       "keyAAD": "OpenBurnBar-HermesRelay-v1|gatewayAttachmentKey|u-hpke-v3|c-hpke-v3|a-hpke-v3",
       "kind": "attachment_manifest",
       "name": "agent_reply_attachment_manifest",
       "payloadAAD": "OpenBurnBar-HermesRelay-v1|gatewayAttachmentManifest|u-hpke-v3|c-hpke-v3|a-hpke-v3",
-      "payloadCiphertext": "5BPstPolsOWZpVthaBe8h8PNp61tUpBzxTIPLXcfLlxfkUq/iaeUOmB94IfZHfI7YcyB4aUr7PqFagNGKgu7R07dteG9ykL0enDsGIQv5QHDKaaU4E/6yInz+94J68hTQVV9G0eXGvvOLkcvNOM=",
-      "payloadPlaintext": "{\"fileName\":\"quarterly-report.pdf\",\"contentType\":\"application/pdf\",\"byteCount\":20}",
+      "payloadCiphertext": "0EPRE2JmUfdrNUeHIqcXa7cLX86LlXrxfSO+xvJdioleCiHl4IKO0neOZLLf65XLhoy0VDuprjKZ/G7ZZ4C5RlxX+lLHreKgR1qqO1x7CJ/qCGBqoRF7ppX2BISRNr0VxAGxASzJOqGMSA7FLxdGxkkI/lbJE/iHZRfbOAR+DjdgtXMlDyvXX2dk+ATg",
+      "payloadPlaintext": "{\"fileName\":\"quarterly-report.pdf\",\"contentType\":\"application/pdf\",\"byteCount\":20,\"destinationId\":\"burnbar:home\"}",
       "pinnedSenderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "plaintextContentKey": "REtSWWBnbnV8g4qRmJ+mrbS7wsnQ197l7PP6Bg0UGyI=",
       "recipientPrivateKeyRaw": "EEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgI=",
@@ -90,20 +90,20 @@
       "relayKeyVersion": 3,
       "senderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "uid": "u-hpke-v3",
-      "wrappedKey": "sZgSCcS/3JSGpddgUAz9/Md98h1w234I2RM1Zazh2ogrYY/5Moy7Uu4MtSg8dNM7"
+      "wrappedKey": "PX6Tj8vQjS67nlUe3ogz3DTUmcd15C3MXSdCW8P25jtujp76lZrUjv7KaiThWEL8"
     },
     {
       "attachmentId": "a-hpke-v3",
       "clientId": "c-hpke-v3",
       "direction": "agent_to_phone",
-      "enc": "BKjfGOruS0+zk9k1bmdTs1kwGkT0C5TWpjGUyZKoJ6Wax4SJvk9GxtCfU4qFhb8v7v4omQUwSi/eO1hmlheJYEk=",
+      "enc": "BEGq0KE8PIW0GlIAcPxAfYc8y+kv64f/c3ZC/0dGl3pdTCpZMlRBfRTmTZ8uHgbZkuL3miruOknVppq28XfAHbY=",
       "expected": "open",
       "info": "OpenBurnBar-HermesRelay-HPKE-v3|OpenBurnBar-HermesRelay-v1|gatewayAttachmentKey|u-hpke-v3|c-hpke-v3|a-hpke-v3",
       "keyAAD": "OpenBurnBar-HermesRelay-v1|gatewayAttachmentKey|u-hpke-v3|c-hpke-v3|a-hpke-v3",
       "kind": "attachment_body_key",
       "name": "agent_reply_attachment_body_key",
       "payloadAAD": "OpenBurnBar-HermesRelay-v1|gatewayAttachmentBody|u-hpke-v3|c-hpke-v3|a-hpke-v3",
-      "payloadCiphertext": "OD2aBclbXSauMZkQg6tHm/NrKZklKb+QzC/ErIMr9jnu5VRQMiUYvvLvkjrEOxqG",
+      "payloadCiphertext": "AFVnO1jhkfB/UyyEWPiL054NjP8jW9Mk+pcgO+MPa83jnOIup/6meQhURGxRtwmE",
       "payloadPlaintext": "PDF-BYTES-1234567890",
       "pinnedSenderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "plaintextContentKey": "REtSWWBnbnV8g4qRmJ+mrbS7wsnQ197l7PP6Bg0UGyI=",
@@ -113,7 +113,7 @@
       "relayKeyVersion": 3,
       "senderPublicKeyX963": "BLkhK4/QR3AL2Xa/LM65Ox1o5E1le/O7st0/KJkqmhtdA58IexfvD4hHg9m187+V1VB7agV3bVQsT7YjM97ZuDE=",
       "uid": "u-hpke-v3",
-      "wrappedKey": "sZgSCcS/3JSGpddgUAz9/Md98h1w234I2RM1Zazh2ogrYY/5Moy7Uu4MtSg8dNM7"
+      "wrappedKey": "PX6Tj8vQjS67nlUe3ogz3DTUmcd15C3MXSdCW8P25jtujp76lZrUjv7KaiThWEL8"
     },
     {
       "derivedFrom": "phone_event_text",
@@ -145,7 +145,7 @@
     {
       "derivedFrom": "phone_event_text",
       "detail": "A single-byte flip of a valid X9.63 point yields an off-curve point, rejected at point validation (fail-closed, before any DH).",
-      "encOverride": "BBysJZbliFifrpWscIN/UJAjTt5d4hhSX1zL0eRDpwPiV64J3SnBufU7NQP2+YhW3sq99/2Pv6mT87DWK4z6l90=",
+      "encOverride": "BIPN5IZxNHwyQWazLsJkVH93ZWKyhSn+jrj/Eaj8sr9GQ7O+oU8VGrkQhQfSEEc7jtjuFC0vmVjL4kp8mL21evE=",
       "expected": "reject",
       "expectedError": "HpkeError",
       "mutation": "enc",
@@ -154,7 +154,7 @@
     {
       "derivedFrom": "phone_event_text",
       "detail": "A DIFFERENT valid ephemeral point -> AuthDecap derives a wrong shared secret -> AEAD InvalidTag (complements the off-curve mutated_enc).",
-      "encOverride": "BB8o51jn+QY4lB9r7OFNTS7dqV/YuS5ckLh3ewyhXrxbweo81cz5P/1Lm2vXSimW0ydjz7bfvfotAyiedNv5ayY=",
+      "encOverride": "BAPvmZSSG8YNgL8wfY9rn7E38f8swpHczhI2dKiCiyulncqMsfkGZ4VFemBBcg3aXwUVbjZNKdbXO1MYLpEQO48=",
       "expected": "reject",
       "expectedError": "InvalidTag",
       "mutation": "enc",
@@ -167,7 +167,7 @@
       "expectedError": "InvalidTag",
       "mutation": "wrapped_key",
       "name": "mutated_wrapped_key",
-      "wrappedKeyOverride": "5E1NgRDu2WHwV2QIiAtOPDR/2ba8lEJamYi12ML76Sh97OkiTRSG37jcbrOnVSLv"
+      "wrappedKeyOverride": "n0Ws90rGrWdBJKWqzVLuE9t9EQtu9cS7Z0GS2OL1faruGfau0AzS5bbDPrP9XY1y"
     },
     {
       "derivedFrom": "phone_event_text",
@@ -209,7 +209,7 @@
   "generator": {
     "command": "venv/bin/python -m tests.gateway.vectors.generate_burnbar_hpke_v3_vectors",
     "language": "python",
-    "note": "Python RFC 9180 reference (test-lane canonical, byte-identical to gateway/crypto/relay_e2ee.py HPKE primitives). Static keys + content keys deterministic; HPKE ephemerals random. Prefer a Swift-emitted fixture once HermesRelayCrypto v3 lands; re-vendor copies via owners.",
+    "note": "Python RFC 9180 reference (test-lane canonical, byte-identical to gateway/crypto/relay_e2ee.py HPKE primitives). Static keys + content keys deterministic; HPKE ephemerals random. Canonical fixture owner: Hermes gateway vector lane; re-vendor copies into BurnBar Android and any Swift fixture from this generator when the v3 contract changes.",
     "reference": "tests/gateway/vectors/hpke_v3_reference.py"
   },
   "hpke": {

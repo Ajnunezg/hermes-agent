@@ -252,6 +252,7 @@ def test_register_shape_matches_platform_registry():
     assert callable(kwargs["adapter_factory"])
     assert callable(kwargs["setup_fn"])
     assert callable(kwargs["standalone_sender_fn"])
+    assert kwargs["allow_update_command"] is False
     assert "supports_media" not in kwargs
 
 
@@ -262,6 +263,9 @@ def _legacy_adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
+    monkeypatch.delenv(_burnbar.RELAY_PRIVATE_KEY_ENV, raising=False)
+    monkeypatch.setenv("BURNBAR_ALLOW_PLAINTEXT", "1")
+    monkeypatch.setattr(_burnbar, "_load_relay_private_key_base64_from_keychain", lambda: None)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
     return BurnBarAdapter(cfg)
 
@@ -893,12 +897,12 @@ async def test_standalone_send_seals_on_paired_link(monkeypatch, tmp_path):
     monkeypatch.setenv("BURNBAR_RELAY_PEER_PUBLIC_KEY", phone_priv.public_key_base64())
     monkeypatch.setenv("BURNBAR_RELAY_UID", "uid-s")
     monkeypatch.setenv("BURNBAR_RELAY_CLIENT_ID", "client-s")
-    # Inject a deterministic agent identity so __init__ does not persist to disk.
+    # Inject a deterministic agent identity so __init__ does not touch Keychain.
     agent_priv = relay_e2ee.generate_private_key()
     monkeypatch.setattr(
-        relay_e2ee.AgentRelayIdentity,
-        "load_or_create",
-        classmethod(lambda cls, **kw: relay_e2ee.AgentRelayIdentity(agent_priv)),
+        _burnbar,
+        "_load_or_create_relay_identity_secure",
+        lambda **kw: relay_e2ee.AgentRelayIdentity(agent_priv),
     )
 
     client = _RecordingClient(post_responses={"/messages": _FakeResponse({"message": {"id": "sm"}})})
@@ -943,9 +947,9 @@ async def test_standalone_send_refuses_when_paired_but_no_peer_key(monkeypatch, 
     monkeypatch.delenv("BURNBAR_RELAY_PEER_PUBLIC_KEY", raising=False)
     agent_priv = relay_e2ee.generate_private_key()
     monkeypatch.setattr(
-        relay_e2ee.AgentRelayIdentity,
-        "load_or_create",
-        classmethod(lambda cls, **kw: relay_e2ee.AgentRelayIdentity(agent_priv)),
+        _burnbar,
+        "_load_or_create_relay_identity_secure",
+        lambda **kw: relay_e2ee.AgentRelayIdentity(agent_priv),
     )
 
     client = _RecordingClient()
@@ -968,14 +972,12 @@ async def test_standalone_send_refuses_when_paired_but_no_peer_key(monkeypatch, 
 # --- Finding 4: key persistence (minted key survives reload) ----------------
 @requires_relay
 def test_relay_identity_persists_and_survives_reload(monkeypatch, tmp_path):
-    """A freshly minted agent key is persisted and reloads to the SAME identity."""
+    """A freshly minted agent key is persisted in the secure store and reloads."""
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     store: dict[str, str] = {}
-
-    import hermes_cli.config as _cfg
-
-    monkeypatch.setattr(_cfg, "save_env_value", lambda k, v: store.__setitem__(k, v), raising=False)
+    monkeypatch.setattr(_burnbar, "_load_relay_private_key_base64_from_keychain", lambda: None)
+    monkeypatch.setattr(_burnbar, "_relay_key_persister", lambda: lambda k, v: store.__setitem__(k, v))
     # Ensure the mint path runs (no key pre-loaded).
     monkeypatch.delenv(_burnbar.RELAY_PRIVATE_KEY_ENV, raising=False)
 
@@ -984,8 +986,10 @@ def test_relay_identity_persists_and_survives_reload(monkeypatch, tmp_path):
     adapter._relay_e2e_enabled = True
     identity = adapter._ensure_relay_identity()
     assert identity is not None
-    # The minted private key was persisted under the relay env var.
+    # The minted private key was handed to the secure-store persister under the
+    # legacy key name, without writing it back into the process environment.
     assert _burnbar.RELAY_PRIVATE_KEY_ENV in store
+    assert os.getenv(_burnbar.RELAY_PRIVATE_KEY_ENV) is None
     pub_before = adapter._relay_public_key_base64()
 
     # Reload from the persisted value -> identical key (no rotation across restart).
@@ -996,6 +1000,25 @@ def test_relay_identity_persists_and_survives_reload(monkeypatch, tmp_path):
 
 
 @requires_relay
+def test_relay_identity_imports_legacy_env_to_secure_store(monkeypatch, tmp_path):
+    """Existing .env relay identities are validated and imported, not rotated."""
+    monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
+    store: dict[str, str] = {}
+    legacy_private = relay_e2ee.generate_private_key()
+    monkeypatch.setattr(_burnbar, "_load_relay_private_key_base64_from_keychain", lambda: None)
+    monkeypatch.setattr(_burnbar, "_relay_key_persister", lambda: lambda k, v: store.__setitem__(k, v))
+    monkeypatch.setenv(_burnbar.RELAY_PRIVATE_KEY_ENV, legacy_private.raw_base64())
+
+    cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
+    adapter = BurnBarAdapter(cfg)
+    adapter._relay_e2e_enabled = True
+    identity = adapter._ensure_relay_identity()
+
+    assert identity.public_key_base64 == legacy_private.public_key_base64()
+    assert store[_burnbar.RELAY_PRIVATE_KEY_ENV] == legacy_private.raw_base64()
+
+
+@requires_relay
 def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
     """Device-poll may return the phone pubkey inside a client view; setup must still persist E2E."""
     saved: dict[str, str] = {}
@@ -1003,9 +1026,9 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
     agent_public_key = relay_e2ee.generate_private_key().public_key_base64()
     monkeypatch.setattr(_burnbar, "RELAY_CRYPTO_AVAILABLE", True)
     monkeypatch.setattr(
-        _burnbar.relay_e2ee.AgentRelayIdentity,
-        "load_or_create",
-        lambda *args, **kwargs: type("Identity", (), {"public_key_base64": agent_public_key})(),
+        _burnbar,
+        "_load_or_create_relay_identity_secure",
+        lambda **kwargs: type("Identity", (), {"public_key_base64": agent_public_key})(),
     )
     monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda key, value: saved.__setitem__(key, value))
     monkeypatch.setattr("hermes_cli.setup.get_env_value", lambda key: None)
@@ -1035,9 +1058,21 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
         def post(self, url, json=None):
             if url.endswith("/device/start"):
                 assert json["agentRelayPublicKey"] == agent_public_key
+                assert json["agentRelayKeyVersion"] == _burnbar.RELAY_KEY_VERSION
+                assert json["agentRelayEncryption"] == _burnbar.RELAY_ENCRYPTION
                 assert json["relayKeyVersion"] == _burnbar.RELAY_KEY_VERSION
                 assert json["gatewayRelayKeyVersion"] == _burnbar.GATEWAY_RELAY_KEY_VERSION_V3
                 assert json["gatewayRelayEncryption"] == _burnbar.GATEWAY_RELAY_ENCRYPTION_V3
+                assert json["supportedGatewayRelayKeyVersions"] == [
+                    _burnbar.GATEWAY_RELAY_KEY_VERSION,
+                    _burnbar.GATEWAY_RELAY_KEY_VERSION_V3,
+                ]
+                assert json["supportsRelayEnvelopeVersions"] == [
+                    _burnbar.GATEWAY_RELAY_KEY_VERSION,
+                    _burnbar.GATEWAY_RELAY_KEY_VERSION_V3,
+                ]
+                assert json["preferredRelayEnvelopeVersion"] == _burnbar.GATEWAY_RELAY_KEY_VERSION_V3
+                assert json["supportsHpkeV3"] is True
                 return _FakeResponse({"deviceCode": "dev", "userCode": "AB12-CD34", "interval": 0, "verificationUriComplete": "https://example.test"})
             if url.endswith("/device/poll"):
                 return _FakeResponse({
@@ -1064,6 +1099,7 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
     assert saved[_burnbar.RELAY_PEER_KEY_VERSION_ENV] == str(_burnbar.GATEWAY_RELAY_KEY_VERSION_V3)
     assert saved["BURNBAR_RELAY_CLIENT_ID"] == "hgw_1"
     assert saved["BURNBAR_RELAY_UID"] == "uid_1"
+    assert "BURNBAR_ALLOW_ALL_USERS" not in saved
     assert prompt_defaults == [False]
 
 
@@ -1076,9 +1112,9 @@ def test_setup_aborts_e2e_when_grant_missing_routing_ids(monkeypatch):
     agent_public_key = relay_e2ee.generate_private_key().public_key_base64()
     monkeypatch.setattr(_burnbar, "RELAY_CRYPTO_AVAILABLE", True)
     monkeypatch.setattr(
-        _burnbar.relay_e2ee.AgentRelayIdentity,
-        "load_or_create",
-        lambda *args, **kwargs: type("Identity", (), {"public_key_base64": agent_public_key})(),
+        _burnbar,
+        "_load_or_create_relay_identity_secure",
+        lambda **kwargs: type("Identity", (), {"public_key_base64": agent_public_key})(),
     )
     monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda key, value: saved.__setitem__(key, value))
     monkeypatch.setattr("hermes_cli.setup.get_env_value", lambda key: None)
@@ -1282,6 +1318,38 @@ def test_replay_ledger_persists_authenticated_high_water(monkeypatch, tmp_path):
     assert adapter2._is_replay_counter_seen(10) is False
 
 
+@requires_relay
+@pytest.mark.asyncio
+async def test_sealed_replay_counter_is_global_per_paired_client(monkeypatch, tmp_path):
+    """Phase 1 replay scope: one paired uid/clientId/pinned-peer bucket has one
+    monotonic replayCounter across all event kinds and destinations."""
+    _no_persist(monkeypatch)
+    phone_priv = relay_e2ee.generate_private_key()
+    adapter, _agent = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_priv.public_key_base64())
+    received = []
+    adapter.handle_message = lambda e: received.append(e) or _noop()
+
+    await adapter._handle_burnbar_event(
+        _phone_sealed_event(
+            adapter,
+            phone_priv,
+            "evt-global-counter-5",
+            {"text": "first", "destinationId": "burnbar:home", "replayCounter": 5},
+        )
+    )
+    await adapter._handle_burnbar_event(
+        _phone_sealed_event(
+            adapter,
+            phone_priv,
+            "evt-global-counter-4-other-dest",
+            {"text": "old", "destinationId": "burnbar:other", "replayCounter": 4},
+        )
+    )
+
+    assert [event.text for event in received] == ["first"]
+    assert adapter._event_replay_high_water == 5
+
+
 # --- Finding 7: model_switch must be sealed on E2E links --------------------
 @requires_relay
 @pytest.mark.asyncio
@@ -1466,6 +1534,32 @@ def test_pin_peer_key_default_refuses_new_pin(monkeypatch, tmp_path):
 
     assert adapter._pin_peer_public_key("burnbar:home", attacker, source="state") is False
     assert adapter._peer_public_key is None
+
+
+@requires_relay
+def test_pin_peer_key_rejects_malformed_key_even_from_pairing(monkeypatch, tmp_path):
+    """The pin helper validates before persistence, even on the authenticated
+    pairing path. A malformed key must not become the future trust anchor."""
+    saved = []
+    import hermes_cli.config as _cfg
+
+    monkeypatch.setattr(_cfg, "save_env_value", lambda *a, **k: saved.append(a), raising=False)
+    adapter, _agent = _e2e_adapter(monkeypatch, tmp_path)
+
+    assert (
+        adapter._pin_peer_public_key(
+            "burnbar:home", "not-base64!", source="pairing", allow_new_pin=True
+        )
+        is False
+    )
+    assert (
+        adapter._pin_peer_public_key(
+            "burnbar:home", "AQIDBAUGBwg=", source="pairing", allow_new_pin=True
+        )
+        is False
+    )
+    assert adapter._peer_public_key is None
+    assert saved == []
 
 
 @requires_relay
@@ -1762,6 +1856,91 @@ async def test_mp6_mp27_sealed_followup_carries_actionid(monkeypatch, tmp_path):
     assert opened["actionId"] == "act_42"
     assert opened["kind"] == "approval"
     assert "rm -rf" in opened["text"]  # detail is end-to-end encrypted, not plaintext
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_sealed_chat_text_json_cannot_escalate_to_control(monkeypatch, tmp_path):
+    """JSON inside chat text is still chat text. State-changing controls must
+    carry an authenticated top-level kind; the adapter must not promote a chat
+    body like {"kind":"oversight_mode"} into a control event."""
+    phone_priv = relay_e2ee.generate_private_key()
+    adapter, _agent = _e2e_adapter(
+        monkeypatch, tmp_path, peer_public_key=phone_priv.public_key_base64()
+    )
+    adapter._oversight_mode = "supervised"
+    received = []
+    adapter.handle_message = lambda e: received.append(e) or _noop()
+
+    raw = _phone_sealed_event(
+        adapter,
+        phone_priv,
+        "evt_json_text_control_spoof",
+        {
+            "text": '{"kind":"oversight_mode","mode":"autonomous"}',
+            "destinationId": "burnbar:home",
+            "replayCounter": 1,
+        },
+    )
+
+    await adapter._handle_burnbar_event(raw)
+
+    assert adapter._oversight_mode == "supervised"
+    assert len(received) == 1
+    assert received[0].text == '{"kind":"oversight_mode","mode":"autonomous"}'
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_repeated_malformed_sealed_event_is_throttled_by_frame_fingerprint(monkeypatch, tmp_path):
+    """Repeated identical malformed sealed frames are throttled by ciphertext
+    fingerprint, not by event id, so they do not cause unbounded unwrap/log churn
+    and do not pre-poison a later valid event with different ciphertext."""
+    phone_priv = relay_e2ee.generate_private_key()
+    adapter, _agent = _e2e_adapter(
+        monkeypatch, tmp_path, peer_public_key=phone_priv.public_key_base64()
+    )
+    received = []
+    adapter.handle_message = lambda e: received.append(e) or _noop()
+    original_open_event = adapter._sealer.open_event
+    open_attempts = []
+
+    def open_event(raw):
+        envelope = raw.get("relayEnvelope") if isinstance(raw.get("relayEnvelope"), dict) else {}
+        if envelope.get("payloadCiphertext") == "not-base64!":
+            open_attempts.append(raw.get("id"))
+            raise ValueError("bad ciphertext")
+        return original_open_event(raw)
+
+    monkeypatch.setattr(adapter._sealer, "open_event", open_event)
+    malformed = {
+        "id": "evt_malformed",
+        "destinationId": "burnbar:home",
+        "relayEnvelope": {
+            "eventId": "evt_malformed",
+            "payloadCiphertext": "not-base64!",
+            "wrappedKey": "also-bad!",
+            "senderPublicKey": phone_priv.public_key_base64(),
+            "relayEncryption": _burnbar.RELAY_ENCRYPTION,
+            "relayKeyVersion": _burnbar.GATEWAY_RELAY_KEY_VERSION,
+        },
+    }
+
+    await adapter._handle_burnbar_event(dict(malformed))
+    await adapter._handle_burnbar_event(dict(malformed))
+    assert open_attempts == ["evt_malformed"]
+    assert len(adapter._malformed_sealed_event_failures) == 1
+    assert adapter._event_replay_key("evt_malformed") not in adapter._seen_event_ids
+
+    await adapter._handle_burnbar_event(
+        _phone_sealed_event(
+            adapter,
+            phone_priv,
+            "evt_malformed",
+            {"text": "valid later", "destinationId": "burnbar:home", "replayCounter": 1},
+        )
+    )
+    assert [event.text for event in received] == ["valid later"]
 
 
 @requires_relay

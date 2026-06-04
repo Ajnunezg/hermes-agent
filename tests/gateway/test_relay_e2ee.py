@@ -498,6 +498,7 @@ def test_gateway_message_sealed_by_swift_opens_in_python(gateway_vector):
     assert plaintext.decode("utf-8") == message["plaintext"]
     decoded = json.loads(plaintext.decode("utf-8"))
     assert decoded["text"] == "Hermes replied over the encrypted gateway."
+    assert decoded["destinationId"] == "burnbar:home"
 
 
 def test_gateway_model_switch_sealed_by_swift_opens_under_event_aads(gateway_vector):

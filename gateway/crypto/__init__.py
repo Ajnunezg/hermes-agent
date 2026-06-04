@@ -15,6 +15,10 @@ relay server ever seeing plaintext.
 The v3 key-wrap (:func:`wrap_symmetric_key_v3` / :func:`unwrap_symmetric_key_v3`)
 is the RFC 9180 HPKE Auth-mode replacement for the bespoke v2 key wrap; it lives
 beside the v1/v2 helpers so the adapter keeps a single crypto surface.
+
+The ratcheted messaging primitive lives in :mod:`gateway.crypto.hermes_ratchet`.
+It remains standalone until the BurnBar gateway schema carries ratchet session
+and prekey fields.
 """
 
 from .relay_e2ee import (

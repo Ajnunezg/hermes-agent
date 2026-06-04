@@ -207,7 +207,10 @@ def _build_positive_cases() -> list[dict]:
             sender_pub=_AGENT_PUB,
             key_aad=_aad("gatewayMessageKey", _UID, _CLIENT_ID, message_id),
             payload_aad=_aad("gatewayMessage", _UID, _CLIENT_ID, message_id),
-            payload_plaintext='{"text":"Hermes replied over the encrypted gateway."}',
+            payload_plaintext=(
+                '{"text":"Hermes replied over the encrypted gateway.",'
+                '"destinationId":"burnbar:home"}'
+            ),
             content_key=msg_key,
             enc_b64=m_enc,
             wrapped_b64=m_wrapped,
@@ -237,7 +240,8 @@ def _build_positive_cases() -> list[dict]:
             payload_aad=_aad("gatewayAttachmentManifest", _UID, _CLIENT_ID, attachment_id),
             payload_plaintext=(
                 '{"fileName":"quarterly-report.pdf",'
-                '"contentType":"application/pdf","byteCount":20}'
+                '"contentType":"application/pdf","byteCount":20,'
+                '"destinationId":"burnbar:home"}'
             ),
             content_key=body_key,
             enc_b64=a_enc,
@@ -425,8 +429,9 @@ def build_fixture() -> dict:
             "note": (
                 "Python RFC 9180 reference (test-lane canonical, byte-identical to "
                 "gateway/crypto/relay_e2ee.py HPKE primitives). Static keys + content "
-                "keys deterministic; HPKE ephemerals random. Prefer a Swift-emitted "
-                "fixture once HermesRelayCrypto v3 lands; re-vendor copies via owners."
+                "keys deterministic; HPKE ephemerals random. Canonical fixture owner: "
+                "Hermes gateway vector lane; re-vendor copies into BurnBar Android and "
+                "any Swift fixture from this generator when the v3 contract changes."
             ),
         },
         "keys": {

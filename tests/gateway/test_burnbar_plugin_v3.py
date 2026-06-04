@@ -76,6 +76,7 @@ def _e2e_adapter(monkeypatch, tmp_path, *, peer_public_key=None, peer_key_versio
     same value the authenticated ``BURNBAR_RELAY_PEER_KEY_VERSION`` pin would
     produce), so a test can opt a link into v3 without the env round-trip.
     """
+    monkeypatch.delenv(_burnbar.GATEWAY_HPKE_V3_DISABLED_ENV, raising=False)
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
@@ -139,8 +140,9 @@ def _phone_sealed_event_v3(
 
 
 @requires_relay
-def test_coerce_peer_relay_key_version_floors_unsupported():
+def test_coerce_peer_relay_key_version_floors_unsupported(monkeypatch):
     coerce = _burnbar._coerce_peer_relay_key_version
+    monkeypatch.delenv(_burnbar.GATEWAY_HPKE_V3_DISABLED_ENV, raising=False)
     assert coerce("3") == 3
     assert coerce(3) == 3
     assert coerce("2") == 2
@@ -148,6 +150,9 @@ def test_coerce_peer_relay_key_version_floors_unsupported():
     assert coerce("1") == 2  # v1 is unsupported on the gateway -> floor to v2
     assert coerce("9") == 2  # unknown future version -> floor to v2
     assert coerce("garbage") == 2
+    monkeypatch.setenv(_burnbar.GATEWAY_HPKE_V3_DISABLED_ENV, "1")
+    assert coerce("3") == 2
+    assert coerce(3) == 2
 
 
 @requires_relay
@@ -163,6 +168,17 @@ def test_capability_resolver_per_destination_override(monkeypatch, tmp_path):
     adapter._peer_relay_key_versions[_DEST] = 3
     assert adapter._peer_relay_key_version_for(_DEST) == 3
     # A different destination still floors to the v2 default.
+    assert adapter._peer_relay_key_version_for("burnbar:other") == 2
+
+
+@requires_relay
+def test_capability_resolver_floors_v3_when_break_glass_disabled(monkeypatch, tmp_path):
+    adapter, _ = _e2e_adapter(monkeypatch, tmp_path)
+    adapter._peer_relay_key_version_default = 3
+    adapter._peer_relay_key_versions[_DEST] = 3
+    monkeypatch.setenv(_burnbar.GATEWAY_HPKE_V3_DISABLED_ENV, "1")
+
+    assert adapter._peer_relay_key_version_for(_DEST) == 2
     assert adapter._peer_relay_key_version_for("burnbar:other") == 2
 
 

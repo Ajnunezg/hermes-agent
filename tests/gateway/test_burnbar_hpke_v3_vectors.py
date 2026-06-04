@@ -56,6 +56,7 @@ REQUIRED_NEGATIVES = {
 }
 # Event-shaped kinds whose opened payload must satisfy the strict inbound schema.
 _EVENT_KINDS = {"event", "model_switch"}
+_JSON_DESTINATION_KINDS = {"event", "model_switch", "message", "attachment_manifest"}
 _REPLAY_KEYS = ("replayCounter", "eventCounter")
 
 
@@ -156,6 +157,8 @@ def test_positive_case_opens_with_pinned_sender(case):
 
     if case["kind"] in _EVENT_KINDS:
         _assert_strict_event_schema(case, payload)
+    if case["kind"] in _JSON_DESTINATION_KINDS:
+        _assert_destination_bound(case, payload)
 
 
 def _assert_strict_event_schema(case, payload: bytes):
@@ -170,6 +173,13 @@ def _assert_strict_event_schema(case, payload: bytes):
     assert counters, f"{case['name']}: sealed event missing replayCounter/eventCounter"
     assert all(isinstance(c, int) and c >= 0 for c in counters), (
         f"{case['name']}: replay counter must be a non-negative integer"
+    )
+
+
+def _assert_destination_bound(case, payload: bytes):
+    obj = json.loads(payload.decode("utf-8"))
+    assert obj.get("destinationId") == "burnbar:home", (
+        f"{case['name']}: sealed JSON payload missing authenticated destinationId"
     )
 
 
