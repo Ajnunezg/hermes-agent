@@ -117,12 +117,35 @@ so a swap does not reopen the old-frame replay window.
   key exists, defeats everything; the all-key safety code only helps if the human
   actually compares it.
 
-## Integration boundary
+## Adapter integration (wired end-to-end)
 
-This change ships the **crypto reference + tests** (the standards-grounded
-primitives that remediate each risk, KAT-anchored where a vector exists). Wiring
-them into the adapter — v4 negotiation, the signed-seal path, stateful ratchet
-session persistence, and rotation-event handling — and the matching Swift/Kotlin
-client implementations are the next integration stage; the reference here is the
-spec they implement, exactly as the v3 crypto reference grounded the v3 wire
-contract.
+The Python adapter wires all five controls through the real send/open/pairing path
+(the Swift/Kotlin clients mirror the same wire contract):
+
+- **Negotiation.** The agent advertises `supportsHpkeV4` and (at device/start and
+  runtime status) its Ed25519 `agentRelaySigningKey`. The authenticated pairing
+  grant pins the peer signing key and selects the highest supported version (v4
+  preferred), flooring to v3 if the peer signing key is absent. Break-glass:
+  `BURNBAR_DISABLE_GATEWAY_HPKE_V4` forces v2/v3-only emission.
+- **Signed wrap.** `seal_message` / `seal_model_switch` emit a v4 signed envelope
+  on a v4 link; `_open_envelope` version-dispatches v4 to verify the Ed25519
+  signature (pinned key) AND the HPKE unwrap, refusing a frame missing its
+  marker / `enc` / `senderSig` / pinned signing key.
+- **Pairing safety code.** Binds all pinned keys (encryption + signing) via
+  `_relay_safety_code_v4` so a substituted signing key changes the human code.
+- **Ratchet chat lane (opt-in `BURNBAR_RELAY_RATCHET=1`).** The agent bootstraps a
+  responder session from the pinned relay keys (no handshake), seals chat replies
+  through the ratchet, opens `ratchetEnvelope` frames in `open_event`, and
+  persists sessions (0600, survives restart). The agent falls back to the v4
+  signed wrap until it has received the initiator's first message. Control events
+  always use the signed wrap.
+- **Rotation.** A sealed `key_rotation` control event is verified against the
+  pinned peer identity key (monotonic epoch + window), then the pinned peer key is
+  swapped atomically; the replay high-water is not reset and the cached ratchet
+  session is dropped.
+
+New env keys: `BURNBAR_RELAY_SIGNING_KEY` (agent signing seed),
+`BURNBAR_RELAY_PEER_SIGNING_KEY` (pinned peer signing key),
+`BURNBAR_RELAY_PEER_KEY_EPOCH` (rotation epoch), `BURNBAR_RELAY_RATCHET` (chat-lane
+opt-in), `BURNBAR_DISABLE_GATEWAY_HPKE_V4` (break-glass). The matching Swift/Kotlin
+client implementations follow this same reference wire contract.
