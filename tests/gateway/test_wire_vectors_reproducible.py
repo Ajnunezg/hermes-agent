@@ -35,10 +35,18 @@ def test_gateway_vector_reproduces_from_generator():
     assert gen.build_gateway_vector(committed) == committed
 
 
+def test_gateway_v3_vector_reproduces_from_generator():
+    committed = _committed(gen.GATEWAY_V3_VECTOR_PATH)
+    assert gen.build_gateway_v3_vector(committed) == committed
+
+
 def test_generator_is_byte_deterministic():
     # Two independent regenerations must be identical (no hidden entropy leak).
     assert gen.build_gateway_vector(_committed(gen.GATEWAY_VECTOR_PATH)) == gen.build_gateway_vector(
         _committed(gen.GATEWAY_VECTOR_PATH)
+    )
+    assert gen.build_gateway_v3_vector(_committed(gen.GATEWAY_V3_VECTOR_PATH)) == gen.build_gateway_v3_vector(
+        _committed(gen.GATEWAY_V3_VECTOR_PATH)
     )
     assert gen.build_relay_vector(_committed(gen.RELAY_VECTOR_PATH)) == gen.build_relay_vector(
         _committed(gen.RELAY_VECTOR_PATH)
