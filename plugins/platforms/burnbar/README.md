@@ -11,13 +11,22 @@ message the agent — and supervise it — from the BurnBar iOS/macOS apps.
   messages to the agent.
 - **Replies** via `/messages` and **typing** state via `/typing`.
 - **Attachments** via `/attachments/init` + signed upload + `/attachments/finalize`.
-- **End-to-end relay encryption** (`p256-hkdf-sha256-aesgcm`, via
-  `gateway.crypto.relay_e2ee`): once pairing enables E2E, the adapter uses the v2
-  authenticated key-wrap, seals every outgoing reply body / attachment to the
-  phone's pinned relay key, and opens phone-sealed inbound events only when the
+- **End-to-end relay encryption** (via `gateway.crypto.relay_e2ee`): once pairing
+  enables E2E, the adapter seals every outgoing reply body / attachment to the
+  peer's pinned relay key, and opens peer-sealed inbound events only when the
   AES-GCM tag verifies against that pinned sender key. On an E2E-paired link it
-  refuses plaintext. The BurnBar Cloud gateway is a blind relay — it never sees
+  refuses plaintext. The Cloud gateway is a blind relay — it never sees
   message/event/attachment bodies, sender names, file names, or approval details.
+  Two authenticated key-wraps are negotiated: **v2** (a bespoke authenticated
+  2-DH wrap, kept byte-stable for the existing clients) and **v3** (standard
+  **RFC 9180 HPKE `mode_auth`** over DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256 +
+  AES-256-GCM). The agent emits v3 only to a peer the authenticated pairing grant
+  marked v3-capable and floors an unknown/v2-only peer to v2; the open path
+  dispatches on each envelope's own `relayKeyVersion` and refuses anything outside
+  the supported `{2, 3}` set (so v1 and plaintext stay unreachable on a paired
+  link). v3 wraps only the content key — the payload/attachment AES-256-GCM layers
+  are byte-unchanged. `BURNBAR_DISABLE_GATEWAY_HPKE_V3=1` is a break-glass rollback
+  to v2-only emission.
 - **Safety-code comparison** after setup: when E2E is enabled, the CLI prints the
   same short code BurnBar shows in the Private messages sheet. The prompt defaults
   to **no** and only accepts valid X9.63 P-256 public keys. Matching codes prove
@@ -87,15 +96,18 @@ merge checklist.
 
 This is a relay-only E2E design, not Signal-grade metadata privacy. The relay
 cannot read sealed message text, sender names, approval detail, attachment names,
-or file bytes, and cannot forge post-pairing v2 events without the sender's
+or file bytes, and cannot forge post-pairing v2/v3 events without the sender's
 static private key. It still sees routing ids, event/message ids, timing, and
 approximate ciphertext sizes.
 
-The v2 key wrap is HPKE-AuthEncap-shaped (`ECDH(ephemeral, recipient) ||
-ECDH(senderStatic, recipient)` with domain-separated HKDF info), but it is not
-RFC 9180 HPKE framing. The reason is cross-language wire compatibility with the
-existing Swift/Kotlin `HermesRelayCrypto` vectors. A future standard-HPKE
-migration should use a new `relayKeyVersion`; v2 must remain byte-stable.
+`relayKeyVersion = 3` is standard **RFC 9180 HPKE `mode_auth`** (suite
+DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM); the recipient binds the
+**pinned** sender static key in `AuthDecap`, so the relay cannot forge a wrap.
+v2 is the pre-existing HPKE-AuthEncap-*shaped* bespoke wrap, kept byte-stable for
+cross-language compatibility with the existing Swift/Kotlin `HermesRelayCrypto`
+vectors. Both bind the pinned sender; v3 additionally binds the envelope version
+and suite into the HPKE `info`. See [`SECURITY.md`](SECURITY.md) for the suite
+constants, the attack matrix, and the v2→v3 migration behaviour.
 
 KCI and static-key compromise are explicit non-goals. If the recipient static
 private key is stolen, past messages wrapped to that key can be decrypted and an
@@ -113,6 +125,10 @@ From the Hermes repo root:
 
 ```bash
 # Plugin registration, event mapping, send/typing/attachments, oversight,
-# runtime status + model switch, and the relay seal -> open round-trip.
-scripts/run_tests.sh tests/gateway/test_burnbar_plugin.py tests/gateway/test_relay_e2ee.py tests/gateway/test_relay_e2ee_v2.py
+# runtime status + model switch, the relay seal -> open round-trip, and the v2/v3
+# key-wrap known-answer vectors (incl. the RFC 9180 Appendix-A HPKE Auth vector).
+scripts/run_tests.sh \
+  tests/gateway/test_burnbar_plugin.py tests/gateway/test_burnbar_plugin_v3.py \
+  tests/gateway/test_relay_e2ee.py tests/gateway/test_relay_e2ee_v2.py \
+  tests/gateway/test_relay_e2ee_v3.py tests/gateway/test_wire_vectors_reproducible.py
 ```
