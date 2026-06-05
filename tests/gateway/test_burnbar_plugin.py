@@ -426,6 +426,8 @@ async def test_autonomous_oversight_auto_approves(tmp_path, monkeypatch):
 
 def test_runtime_status_payload_shape(monkeypatch):
     # Force the inventory import to fail -> empty payload, but still importable.
+    import sys
+    monkeypatch.setitem(sys.modules, "hermes_cli.inventory", None)
     body = _burnbar._runtime_status_payload()
     assert isinstance(body, dict)
     # When inventory is available it has modelOptions; when not, it's {}.
