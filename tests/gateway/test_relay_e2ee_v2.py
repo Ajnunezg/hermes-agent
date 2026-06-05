@@ -1,8 +1,10 @@
-"""v2 authenticated key-wrap interop against the canonical Swift gateway vector.
+"""v2 authenticated key-wrap known-answer tests against the gateway wire vector.
 
-Opens the Swift-emitted ``HermesGatewayWireVector.json`` (``revision == "v2"``) and
+Opens the committed ``HermesGatewayWireVector.json`` (``revision == "v2"``) and
 proves Python unwraps each slot under the v2 2-DH scheme. Forge tests pin a wrong
-sender and expect ``InvalidTag``.
+sender and expect ``InvalidTag``. The vector is regenerated and byte-verified
+in-tree by ``tests/gateway/vectors/generate_wire_vectors.py`` (see
+``tests/gateway/test_wire_vectors_reproducible.py``).
 """
 
 from __future__ import annotations
@@ -129,3 +131,25 @@ def test_v2_wrap_is_domain_separated_from_v1_unwrap():
     )
     with pytest.raises(InvalidTag):
         relay_e2ee.unwrap_symmetric_key(wrapped, recipient, aad)
+
+
+def test_v1_wrap_is_domain_separated_from_v2_unwrap():
+    """The reverse direction: a v1 (anonymous, 1-DH) wrap must NOT open under the v2
+    authenticated unwrap. Together with the forward test this pins BOTH directions of
+    the v1/v2 domain separation at the crypto layer (not just the adapter version gate).
+    """
+    from cryptography.exceptions import InvalidTag
+
+    sender = relay_e2ee.generate_private_key()
+    recipient = relay_e2ee.generate_private_key()
+    symmetric_key = relay_e2ee.generate_symmetric_key()
+    aad = relay_e2ee.key_aad("u", "c", "r")
+    # v1 wrap: no sender_private -> anonymous single-DH, v1 HKDF info prefix.
+    wrapped_v1 = relay_e2ee.wrap_symmetric_key(
+        symmetric_key, recipient.public_key_base64(), aad
+    )
+    # v2 unwrap: binds the pinned sender key + the v2 HKDF info prefix -> wrong key.
+    with pytest.raises(InvalidTag):
+        relay_e2ee.unwrap_symmetric_key(
+            wrapped_v1, recipient, aad, sender_public_base64=sender.public_key_base64()
+        )

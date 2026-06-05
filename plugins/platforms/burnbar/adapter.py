@@ -283,11 +283,15 @@ def _read_replay_ledger() -> Dict[str, Any]:
 def _write_replay_ledger(ledger: Dict[str, Any]) -> None:
     REPLAY_LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = REPLAY_LEDGER_FILE.with_name(f"{REPLAY_LEDGER_FILE.name}.tmp")
-    tmp.write_text(json.dumps(ledger, separators=(",", ":")))
+    data = json.dumps(ledger, separators=(",", ":")).encode("utf-8")
+    # Create the temp file with 0o600 from the start (O_CREAT|O_TRUNC + mode) so
+    # the ledger never has a world-readable window between write and chmod. The
+    # replay keys are opaque SHA-256 digests, but we still fail closed on perms.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.chmod(tmp, 0o600)
-    except Exception:
-        pass
+        os.write(fd, data)
+    finally:
+        os.close(fd)
     tmp.replace(REPLAY_LEDGER_FILE)
 
 
@@ -322,6 +326,15 @@ def _gateway_aad(*parts: str) -> bytes:
     string_parts = [str(p) for p in parts]
     if _RELAY_NAMESPACE is not None:
         return _RELAY_NAMESPACE.aad(string_parts)
+    # Crypto-unavailable fallback. This never runs in production (every caller is a
+    # seal/open that requires `cryptography`), but apply the SAME delimiter guard as
+    # RelayNamespace.aad so it can never emit an unvalidated, collidable AAD even if
+    # a future caller reaches it without the namespace.
+    for part in string_parts:
+        if "|" in part or any(ord(ch) < 0x20 for ch in part):
+            raise ValueError(
+                "gateway AAD part contains an illegal '|' delimiter or control character"
+            )
     return ("|".join([_RELAY_AAD_PREFIX_LITERAL, *string_parts])).encode("utf-8")
 
 
@@ -1108,12 +1121,6 @@ class BurnBarAdapter(BasePlatformAdapter):
             self._relay_identity = relay_e2ee.AgentRelayIdentity.load_or_create(
                 env_var=RELAY_PRIVATE_KEY_ENV, persist=persist
             )
-        except TypeError:
-            # Tolerate an older signature that takes no env_var / persist kwarg.
-            try:
-                self._relay_identity = relay_e2ee.AgentRelayIdentity.load_or_create(persist=persist)
-            except TypeError:
-                self._relay_identity = relay_e2ee.AgentRelayIdentity.load_or_create()
         except relay_e2ee.CorruptIdentityError:
             logger.error(
                 "[%s] corrupt relay private key in %s; refusing E2E (re-pair or delete the key)",
@@ -1645,11 +1652,22 @@ class BurnBarAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=event_id,
         )
+        # On an E2E-authenticated event, do NOT forward the relay-supplied ciphertext
+        # envelope (relayEnvelope / payloadCiphertext / wrappedKey / senderPublicKey)
+        # downstream into the trajectory: it is opaque to the agent and only bloats
+        # session logs / exports with blobs the relay already holds. Carry just the
+        # routing-relevant fields. Legacy plaintext events pass the raw doc unchanged.
+        if authed is not None:
+            raw_message: Dict[str, Any] = {"id": event_id, "destinationId": destination_id}
+            if raw.get("relayEncryption"):
+                raw_message["relayEncryption"] = raw["relayEncryption"]
+        else:
+            raw_message = raw
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
-            raw_message=raw,
+            raw_message=raw_message,
             message_id=event_id,
         )
         await self.handle_message(event)
@@ -2151,7 +2169,17 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
     return extra or None
 
 
-def _poll_device_authorization(api_base: str, device_code: str, device_secret: str, interval: int) -> dict:
+def _poll_device_authorization(
+    api_base: str,
+    device_code: str,
+    device_secret: str,
+    interval: int,
+    timeout_seconds: float = 600.0,
+) -> dict:
+    # Bound the wait so `hermes gateway setup` cannot hang forever on a stuck
+    # `pending` if the server never reports denied/expired. The deadline tracks the
+    # grant's own `expiresIn` (capped at a sane default by the caller).
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
     with httpx.Client(timeout=30) as client:
         while True:
             poll = client.post(
@@ -2164,6 +2192,11 @@ def _poll_device_authorization(api_base: str, device_code: str, device_secret: s
                 return status
             if status.get("status") in {"denied", "expired"}:
                 raise RuntimeError(f"BurnBar link {status['status']}")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "BurnBar link approval timed out; re-run `hermes gateway setup` and "
+                    "approve the device code in BurnBar before it expires"
+                )
             time.sleep(interval)
 
 
@@ -2205,15 +2238,9 @@ def interactive_setup() -> None:
             # via save_env_value) so the agent's relay identity is STABLE across
             # restarts; without it the key rotated every restart and silently broke
             # every previously-sealed inbound event.
-            try:
-                identity = relay_e2ee.AgentRelayIdentity.load_or_create(
-                    env_var=RELAY_PRIVATE_KEY_ENV, persist=save_env_value
-                )
-            except TypeError:
-                try:
-                    identity = relay_e2ee.AgentRelayIdentity.load_or_create(persist=save_env_value)
-                except TypeError:
-                    identity = relay_e2ee.AgentRelayIdentity.load_or_create()
+            identity = relay_e2ee.AgentRelayIdentity.load_or_create(
+                env_var=RELAY_PRIVATE_KEY_ENV, persist=save_env_value
+            )
             agent_relay_public_key = _public_key_base64(identity)
         except Exception:
             logger.debug("Could not prepare BurnBar relay identity for pairing", exc_info=True)
@@ -2250,6 +2277,7 @@ def interactive_setup() -> None:
             body["deviceCode"],
             device_secret,
             int(body.get("interval", 3)),
+            timeout_seconds=float(body.get("expiresIn", 600)),
         )
     except Exception as exc:
         print_warning(f"BurnBar authorization failed: {exc}")

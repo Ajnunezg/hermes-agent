@@ -1,10 +1,11 @@
 """End-to-end relay crypto for the BurnBar Hermes gateway.
 
-This package is the Python mirror of the canonical Swift
-``HermesRelayCrypto`` (``OpenBurnBarCore/.../HermesRelayCrypto.swift``) and
-the Kotlin ``HermesRelayCrypto`` (``android/.../data/hermes/relay/``). All
-three open the same wire vector
-(``OpenBurnBarCoreTests/Fixtures/HermesRelayWireVector.json``) byte-for-byte.
+This package is the Python side of the BurnBar relay wire format, which the
+BurnBar iOS (CryptoKit) and Android clients also implement. Its known-answer
+vectors live under ``tests/gateway/fixtures/`` and are regenerated and
+byte-verified in-tree by ``tests/gateway/vectors/generate_wire_vectors.py``;
+cross-language parity with the mobile clients is maintained in those client
+repositories.
 
 The gateway adapter (``plugins/platforms/burnbar/adapter.py``) imports the
 sealing primitives from :mod:`gateway.crypto.relay_e2ee` so the agent can

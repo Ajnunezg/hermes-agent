@@ -126,11 +126,14 @@ wecom = ["defusedxml==0.7.1"]
 # server only store-and-forwards ciphertext. `cryptography` is already in
 # uv.lock transitively (alibabacloud/azure deps pin 46.0.7); this extra makes
 # the dependency explicit and lazy-loadable for installs that enable the
-# BurnBar gateway. Range (>=46) — not an exact pin — because the relay byte
-# format is stable ABI (AES-256-GCM / P-256 / HKDF-SHA256) and we want this
-# leg to track security patches; the core `dependencies` exact-pin policy
-# (top of file) deliberately does not extend to opt-in extras.
-gateway-e2ee = ["cryptography>=46"]
+# BurnBar gateway. Bounded range `>=46.0.7,<47` — a floor (the version already in
+# uv.lock) so the leg tracks 46.x security patches, plus an upper bound at the next
+# major so an unreviewed `cryptography` 47.x cannot be auto-pulled. The relay byte
+# format only depends on the stable AES-256-GCM / P-256 / HKDF-SHA256 primitives,
+# which are ABI-stable within a major. The core `dependencies` exact-pin policy
+# (top of file) does not extend to opt-in extras, but the supply-chain rationale
+# behind it does, hence the capped upper bound rather than an open `>=`.
+gateway-e2ee = ["cryptography>=46.0.7,<47"]
 cli = ["simple-term-menu==1.6.6"]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [
