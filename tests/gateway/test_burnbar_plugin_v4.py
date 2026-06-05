@@ -39,6 +39,16 @@ _UID = "uid-v4"
 _CLIENT = "client-v4"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_state_files(monkeypatch, tmp_path):
+    """Redirect every on-disk state file to a temp dir so tests never touch the
+    real ~/.hermes/cache files (the ratchet store + the replay ledger now both
+    matter for the ratchet lane)."""
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "ratchet.json", raising=False)
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "ledger.json", raising=False)
+    monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json", raising=False)
+
+
 def _no_persist(monkeypatch):
     import hermes_cli.config as _cfg
 
@@ -170,12 +180,178 @@ def test_open_event_refuses_v4_without_marker_or_enc(monkeypatch):
 
 
 @requires_relay
+def test_v4_link_refuses_downgraded_v3_frame(monkeypatch):
+    """Anti-downgrade floor: on a v4-pinned link, a (validly-formed) v3-labeled
+    inbound frame is refused EXPLICITLY before unwrap, not via an incidental parse
+    error — a relay cannot strip the Ed25519 layer by relabeling to v3."""
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    event_id = "evt-dg"
+    key_aad = _burnbar._gateway_event_key_aad(_UID, _CLIENT, event_id)
+    payload_aad = _burnbar._gateway_event_aad(_UID, _CLIENT, event_id)
+    sym = relay_e2ee.generate_symmetric_key()
+    payload_ct = relay_e2ee.seal_to_base64(json.dumps({"text": "x"}).encode(), sym, payload_aad)
+    wrap = relay_e2ee.wrap_symmetric_key_v3(
+        sym, k["agent_enc"].public_key_base64(), key_aad, sender_private=k["phone_enc"]
+    )
+    raw = {
+        "id": event_id, "destinationId": "burnbar:home",
+        "relayEnvelope": {
+            "payloadCiphertext": payload_ct, "wrappedKey": wrap.wrapped_key, "enc": wrap.enc,
+            "relayEncryption": wrap.relay_encryption, "relayKeyVersion": 3, "eventId": event_id,
+            "senderPublicKey": k["phone_enc"].public_key_base64(),
+        },
+    }
+    with pytest.raises(_burnbar._RelayPlaintextRefused):
+        adapter._sealer.open_event(raw)
+
+
+@requires_relay
 def test_floors_to_v3_without_pinned_peer_signing_key(monkeypatch):
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, with_peer_signing=False, **k)
     assert adapter._peer_relay_key_version_for("burnbar:home") == 3
     env = adapter._sealer.seal_message(destination_id="burnbar:home", text="v3 fallback")
     assert env["relayKeyVersion"] == 3 and "senderSig" not in env
+
+
+def _phone_initiator(k):
+    pair = hr.HermesRatchetKeyPair(
+        private_key_base64=k["phone_enc"].raw_base64(),
+        public_key_base64=k["phone_enc"].public_key_base64(),
+    )
+    return hr.bootstrap_session(
+        role=hr.HermesRatchetRole.INITIATOR, uid=_UID, client_id=_CLIENT,
+        local_ratchet_key_pair=pair, peer_ratchet_public_key_base64=k["agent_enc"].public_key_base64(),
+    )
+
+
+def _phone_ratchet_frame(phone, payload, event_id):
+    pe = hr.encrypt(v4.padme_pad(json.dumps(payload).encode()), phone)
+    return {"id": event_id, "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+
+
+# --- FULL-PATTH receive tests: drive the production _handle_burnbar_event ----
+@requires_relay
+@pytest.mark.asyncio
+async def test_ratchet_chat_delivered_through_full_handler(monkeypatch):
+    """Regression for the P1 the audit caught: a phone->agent ratchet chat frame is
+    DELIVERED through the real _handle_burnbar_event path. It was previously dropped
+    at the v4 monotonic replayCounter gate (ratchet payloads carry no counter), and
+    the direct-open_event tests were blind to it."""
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    phone = _phone_initiator(k)
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "hi over ratchet", "destinationId": "burnbar:home"}, "rm1")
+    )
+    assert len(received) == 1 and received[0].text == "hi over ratchet"
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_ratchet_out_of_order_delivered_through_handler(monkeypatch):
+    """The ratchet's skipped-key store tolerates out-of-order delivery through the
+    real handler (the monotonic high-water gate must NOT drop reordered frames)."""
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    phone = _phone_initiator(k)
+    f0 = _phone_ratchet_frame(phone, {"text": "m0", "destinationId": "burnbar:home"}, "rm0")
+    f1 = _phone_ratchet_frame(phone, {"text": "m1", "destinationId": "burnbar:home"}, "rm1")
+    await adapter._handle_burnbar_event(f1)  # deliver the LATER one first
+    await adapter._handle_burnbar_event(f0)  # then the earlier one (skipped key)
+    assert sorted(e.text for e in received) == ["m0", "m1"]
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_control_kind_refused_on_ratchet_lane(monkeypatch):
+    """A control kind (model_switch) smuggled onto the ratchet chat lane is REFUSED
+    (control plane must use the v4 signed lane with the counter gate)."""
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    phone = _phone_initiator(k)
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(
+            phone, {"kind": "model_switch", "modelId": "evil/model", "destinationId": "burnbar:home"}, "rm-ctl"
+        )
+    )
+    assert received == []  # refused, no model switch applied
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_ratchet_refuses_rebootstrap_after_session_loss(monkeypatch):
+    """After a session-store loss, the deterministic bootstrap is REFUSED (replay-
+    on-reset defense): the inbound frame is dropped rather than silently re-opening
+    a pristine session a relay could replay into."""
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    phone = _phone_initiator(k)
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "first", "destinationId": "burnbar:home"}, "r-a")
+    )
+    assert len(received) == 1  # session established
+    # Simulate a session-store loss (the durable "established" marker survives in
+    # the separate replay ledger).
+    adapter._ratchet_sessions.clear()
+    adapter._ratchet_sessions_loaded = False
+    if _burnbar.RATCHET_SESSION_FILE.exists():
+        _burnbar.RATCHET_SESSION_FILE.unlink()
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "replayed-or-new", "destinationId": "burnbar:home"}, "r-b")
+    )
+    assert len(received) == 1  # the post-loss frame is dropped (no silent re-bootstrap)
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_v4_signed_control_through_full_handler(monkeypatch):
+    """A v4-signed model_switch WITH a replayCounter is applied through the real
+    handler (the signed lane still passes the counter gate after the ratchet
+    exemption)."""
+    monkeypatch.delenv("BURNBAR_RELAY_RATCHET", raising=False)
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    event_id = "ms1"
+    payload = {"kind": "model_switch", "modelId": "claude-opus-4-8", "destinationId": "burnbar:home", "replayCounter": 1}
+    raw = _phone_to_agent_v4_event(event_id=event_id, payload=payload, **k)
+    await adapter._handle_burnbar_event(raw)
+    assert received and received[0].text == "/model claude-opus-4-8"
 
 
 def _establish_ratchet(monkeypatch, adapter, k):
