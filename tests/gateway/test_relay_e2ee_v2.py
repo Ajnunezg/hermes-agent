@@ -69,6 +69,9 @@ def test_v2_attachment_unwraps_body_key_and_opens_manifest_and_body(gateway_vect
         node["manifestCiphertext"], body_key, _aad(node["manifestAAD"])
     )
     assert manifest.decode("utf-8") == node["manifestPlaintext"]
+    manifest_json = json.loads(manifest.decode("utf-8"))
+    assert manifest_json["fileName"] == "quarterly-report.pdf"
+    assert manifest_json["destinationId"] == "burnbar:home"
     body = relay_e2ee.open_base64(
         node["bodyCiphertext"], body_key, _aad(node["bodyAAD"])
     )
