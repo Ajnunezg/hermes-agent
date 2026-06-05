@@ -99,13 +99,25 @@ so a swap does not reopen the old-frame replay window.
 
 ## Honest residual risk (after v4)
 
-- **Signing-key compromise** still forges senders — but this moves the trust to a
-  key that *no longer also decrypts* (a `skR` leak alone no longer forges), and the
-  signed rotation path lets a compromised key be retired. Store keys in the OS
-  keychain / Secure Enclave.
+- **Signing-key compromise** still forges senders **on the v4 signed lane** — but
+  this moves the trust to a key that *no longer also decrypts* (a `skR` leak alone
+  no longer forges), and the signed rotation path lets a compromised key be
+  retired. Note the **Double Ratchet chat lane is immune to signing-key
+  compromise**: it authenticates each message via the symmetric chain (the GCM tag
+  over the ratchet header), not the Ed25519 key, so enabling the ratchet closes
+  this residual for conversational messages. Store keys in the OS keychain /
+  Secure Enclave.
 - **No post-quantum protection** — a harvest-now-decrypt-later adversary can break
-  P-256/the ratchet DH with a future quantum computer. A hybrid (ML-KEM) KEM is a
-  later version, explicitly deferred.
+  P-256 / the ratchet DH with a future quantum computer. Closing this is a future
+  wire version (v5), not an additive patch, and is **deliberately deferred** after
+  verifying the current ecosystem (June 2026): `pyca/cryptography` only gained
+  ML-KEM in v48 and only on the AWS-LC / BoringSSL / OpenSSL-3.5+ backends (not the
+  standard wheels most installs ship), ML-KEM-in-HPKE is still in progress, and the
+  Swift/Kotlin clients would each need a matching ML-KEM. A Python-only hybrid now
+  would be unusable end-to-end. The migration path is a hybrid KEM (X25519/P-256 +
+  ML-KEM-768, e.g. RFC 9180 hybrid-KEM / X-Wing) as `relayKeyVersion = 5`, layered
+  the same additive way v4 was. The Double Ratchet already bounds the per-message
+  blast radius in the meantime.
 - **PCS heals only after a DH-ratchet round-trip** — a persistent device implant
   that continuously exfiltrates ratchet state keeps reading until a healing turn.
 - **Timing, frequency, and message ordering** remain visible to a store-and-forward
