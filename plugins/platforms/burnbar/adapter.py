@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - Hermes installs httpx in core.
 
 try:
     from gateway.crypto import relay_e2ee
+    from gateway.crypto import relay_e2ee_v4
 
     RELAY_CRYPTO_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only when cryptography is absent.
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised only when cryptography is ab
     # unavailable" and could silently steer a paired link onto the plaintext path.
     RELAY_CRYPTO_AVAILABLE = False
     relay_e2ee = None  # type: ignore[assignment]
+    relay_e2ee_v4 = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -106,15 +108,38 @@ GATEWAY_RELAY_ENCRYPTION_V3 = (
 # `_supported_gateway_relay_versions()` (which gates EMISSION/advertisement): a v3
 # frame already issued to this agent must still open during a v2-only rollback, so
 # the open set is the fixed `{2, 3}` while emission can be floored to `{2}`.
-_OPENABLE_GATEWAY_RELAY_VERSIONS = (GATEWAY_RELAY_KEY_VERSION, GATEWAY_RELAY_KEY_VERSION_V3)
+# The v4 hardened wrap (v3 HPKE + Ed25519 explicit sender signature + Padmé). Adds
+# KCI resistance and size-metadata padding; emitted only to a peer whose
+# authenticated grant pinned a v4 signing key. Same open-path version dispatch.
+GATEWAY_RELAY_KEY_VERSION_V4 = relay_e2ee_v4.RELAY_KEY_VERSION_V4 if RELAY_CRYPTO_AVAILABLE else 4
+GATEWAY_RELAY_ENCRYPTION_V4 = (
+    relay_e2ee_v4.RELAY_ENCRYPTION_V4
+    if RELAY_CRYPTO_AVAILABLE
+    else "hpke-auth-p256-ed25519sig-aes256gcm"
+)
+# Gateway wrap versions the OPEN path will decrypt. The open path hard-refuses
+# any version outside this set (v1 and plaintext stay unreachable on a paired
+# link). This is deliberately INDEPENDENT of the break-glass flag and of
+# `_supported_gateway_relay_versions()` (which gates EMISSION/advertisement): a v3
+# or v4 frame already issued to this agent must still open during a rollback, so
+# the open set is the fixed `{2, 3, 4}` while emission can be floored to `{2}`.
+_OPENABLE_GATEWAY_RELAY_VERSIONS = (
+    GATEWAY_RELAY_KEY_VERSION,
+    GATEWAY_RELAY_KEY_VERSION_V3,
+    GATEWAY_RELAY_KEY_VERSION_V4,
+)
 # Operator/pairing-pinned peer wrap capability (authenticated, like
-# BURNBAR_RELAY_PEER_PUBLIC_KEY). Set to "3" once the paired peer is known to
-# support RFC 9180 HPKE v3; absent/unknown stays v2. Never read from the
-# untrusted relay runtime path (mirrors the _absorb_relay_state policy).
+# BURNBAR_RELAY_PEER_PUBLIC_KEY). Set to "3"/"4" once the paired peer is known to
+# support that wrap; absent/unknown stays v2. Never read from the untrusted relay
+# runtime path (mirrors the _absorb_relay_state policy).
 RELAY_PEER_KEY_VERSION_ENV = "BURNBAR_RELAY_PEER_KEY_VERSION"
-# Break-glass rollback flag: set to "1" to force the agent back to v2-only
-# emission/negotiation in an emergency. Absent/unset keeps v3 available.
+# The peer's pinned Ed25519 signing key (base64 raw 32B), authenticated at pairing
+# and bound into the safety code. Required to emit/open v4. Never wire-supplied.
+RELAY_PEER_SIGNING_KEY_ENV = "BURNBAR_RELAY_PEER_SIGNING_KEY"
+# Break-glass rollback flags: set to "1" to force the agent back to v2-only
+# (HPKE_V3_DISABLED) or to forbid v4 emission (V4_DISABLED) in an emergency.
 GATEWAY_HPKE_V3_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V3"
+GATEWAY_HPKE_V4_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V4"
 # Single-source the AAD namespace from relay_e2ee. RelayNamespace.aad(parts)
 # yields the locked wire bytes "OpenBurnBar-HermesRelay-v1|" + "|".join(parts);
 # we reuse it with the gateway-flavoured parts so the prefix/version is never
@@ -187,6 +212,34 @@ def _relay_safety_code(agent_public_key_b64: str, phone_public_key_b64: str) -> 
     low, high = sorted((agent_bytes, phone_bytes))
     digest = hashlib.sha256(low + high).digest()
     return " ".join(digest[offset : offset + 2].hex().upper() for offset in range(0, 16, 2))
+
+
+def _relay_safety_code_v4(
+    agent_enc_b64: str, phone_enc_b64: str, agent_sig_b64: str, phone_sig_b64: str
+) -> str:
+    """All-key v4 safety code: binds BOTH peers' encryption AND Ed25519 signing
+    keys, so a relay cannot substitute the new signing key while the human-compared
+    code still matches. Returns ``""`` if any key is missing/invalid (caller then
+    falls back to the two-key code)."""
+    if not RELAY_CRYPTO_AVAILABLE:
+        return ""
+    import base64 as _b64
+
+    try:
+        self_keys = [
+            (relay_e2ee_v4.PAIRING_TAG_ENCRYPTION, relay_e2ee.public_key_x963_from_base64(agent_enc_b64)),
+            (relay_e2ee_v4.PAIRING_TAG_SIGNING, _b64.b64decode(agent_sig_b64, validate=True)),
+        ]
+        peer_keys = [
+            (relay_e2ee_v4.PAIRING_TAG_ENCRYPTION, relay_e2ee.public_key_x963_from_base64(phone_enc_b64)),
+            (relay_e2ee_v4.PAIRING_TAG_SIGNING, _b64.b64decode(phone_sig_b64, validate=True)),
+        ]
+        # Validate the signing keys are real Ed25519 points (32 bytes).
+        relay_e2ee_v4.RelayVerifyKey(self_keys[1][1])
+        relay_e2ee_v4.RelayVerifyKey(peer_keys[1][1])
+    except Exception:
+        return ""
+    return relay_e2ee_v4.relay_safety_code_v4(self_keys=self_keys, peer_keys=peer_keys)
 
 
 # Catalog-id charset for a model-switch value (MP-11). First char alphanumeric so
@@ -343,10 +396,18 @@ def _gateway_hpke_v3_enabled() -> bool:
     return (os.getenv(GATEWAY_HPKE_V3_DISABLED_ENV) or "").strip() != "1"
 
 
+def _gateway_hpke_v4_enabled() -> bool:
+    """True when the v4 hardened wrap (Ed25519 explicit auth + Padmé) may be
+    emitted/advertised. v4 builds on v3 HPKE, so it also requires v3 enabled."""
+    return _gateway_hpke_v3_enabled() and (os.getenv(GATEWAY_HPKE_V4_DISABLED_ENV) or "").strip() != "1"
+
+
 def _supported_gateway_relay_versions() -> list[int]:
     versions = [GATEWAY_RELAY_KEY_VERSION]
     if _gateway_hpke_v3_enabled():
         versions.append(GATEWAY_RELAY_KEY_VERSION_V3)
+    if _gateway_hpke_v4_enabled():
+        versions.append(GATEWAY_RELAY_KEY_VERSION_V4)
     return versions
 
 
@@ -355,7 +416,11 @@ def _preferred_gateway_relay_version() -> int:
 
 
 def _gateway_relay_encryption_for(version: int) -> str:
-    return GATEWAY_RELAY_ENCRYPTION_V3 if version == GATEWAY_RELAY_KEY_VERSION_V3 else RELAY_ENCRYPTION
+    if version == GATEWAY_RELAY_KEY_VERSION_V4:
+        return GATEWAY_RELAY_ENCRYPTION_V4
+    if version == GATEWAY_RELAY_KEY_VERSION_V3:
+        return GATEWAY_RELAY_ENCRYPTION_V3
+    return RELAY_ENCRYPTION
 
 
 def _gateway_relay_capability_payload() -> dict:
@@ -366,10 +431,12 @@ def _gateway_relay_capability_payload() -> dict:
     decision; the open path version-dispatches on the envelope itself.
     """
     preferred = _preferred_gateway_relay_version()
+    supported = _supported_gateway_relay_versions()
     return {
-        "supportsRelayEnvelopeVersions": _supported_gateway_relay_versions(),
+        "supportsRelayEnvelopeVersions": supported,
         "preferredRelayEnvelopeVersion": preferred,
-        "supportsHpkeV3": preferred == GATEWAY_RELAY_KEY_VERSION_V3,
+        "supportsHpkeV3": GATEWAY_RELAY_KEY_VERSION_V3 in supported,
+        "supportsHpkeV4": GATEWAY_RELAY_KEY_VERSION_V4 in supported,
         "clientPlatform": "python-hermes-agent",
     }
 
@@ -384,6 +451,8 @@ def _coerce_peer_relay_key_version(value: Any) -> int:
     """
     counter = _coerce_replay_counter(value)
     if counter == GATEWAY_RELAY_KEY_VERSION:
+        return counter
+    if counter == GATEWAY_RELAY_KEY_VERSION_V4 and _gateway_hpke_v4_enabled():
         return counter
     if counter == GATEWAY_RELAY_KEY_VERSION_V3 and _gateway_hpke_v3_enabled():
         return counter
@@ -404,21 +473,26 @@ def _peer_relay_key_version_from_pairing_grant(approved: dict, client_payload: d
         "phoneRelayKeyVersion",
         "relayKeyVersion",
     )
+    # Pick the HIGHEST supported version the authenticated grant advertises (v4
+    # preferred, then v3, then the v2 floor). _coerce_peer_relay_key_version floors
+    # unknown/disabled versions, so `best` only ever reaches a wrap both sides do.
+    best = GATEWAY_RELAY_KEY_VERSION
     for source in candidates:
         if not isinstance(source, dict):
             continue
         for key in version_keys:
-            version = _coerce_peer_relay_key_version(source.get(key))
-            if version == GATEWAY_RELAY_KEY_VERSION_V3:
-                return version
+            best = max(best, _coerce_peer_relay_key_version(source.get(key)))
     encryption_keys = ("gatewayRelayEncryption", "relayEncryption")
     for source in candidates:
         if not isinstance(source, dict):
             continue
         for key in encryption_keys:
-            if str(source.get(key) or "") == GATEWAY_RELAY_ENCRYPTION_V3:
-                return GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
-    return GATEWAY_RELAY_KEY_VERSION
+            marker = str(source.get(key) or "")
+            if marker == GATEWAY_RELAY_ENCRYPTION_V4 and _gateway_hpke_v4_enabled():
+                best = max(best, GATEWAY_RELAY_KEY_VERSION_V4)
+            elif marker == GATEWAY_RELAY_ENCRYPTION_V3 and _gateway_hpke_v3_enabled():
+                best = max(best, GATEWAY_RELAY_KEY_VERSION_V3)
+    return best
 
 
 def _guess_content_type(path: Path) -> str:
@@ -927,6 +1001,45 @@ class _RelaySealer:
             "senderPublicKey": sender_private.public_key_base64(),
         }
 
+    def _seal_signed_v4(
+        self,
+        *,
+        peer: str,
+        sender_private,
+        destination_id: str,
+        payload_plaintext: bytes,
+        key_aad: bytes,
+        payload_aad: bytes,
+    ) -> dict:
+        """v4 hardened seal: the v3 HPKE content-key wrap + Padmé padding + an
+        Ed25519 explicit sender signature (closes KCI). Emitted only when the
+        peer's authenticated grant pinned a v4 signing key; the agent binds BOTH
+        its own static relay key and its signing key as the authenticated sender.
+        """
+        peer_signing = self._adapter._peer_signing_key_for(destination_id)
+        signing_identity = self._adapter._ensure_signing_identity()
+        if not peer_signing or signing_identity is None:
+            raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
+        env = relay_e2ee_v4.seal_signed_v4(
+            payload_plaintext,
+            recipient_enc_public=peer,
+            recipient_verify_key=peer_signing,
+            sender_enc_private=sender_private,
+            sender_signing_key=signing_identity.signing_key,
+            key_aad=key_aad,
+            payload_aad=payload_aad,
+        )
+        return {
+            "payloadCiphertext": env.payload_ciphertext,
+            "wrappedKey": env.wrapped_key,
+            "enc": env.enc,
+            "senderSig": env.sender_sig,
+            "relayEncryption": env.relay_encryption,
+            "relayKeyVersion": env.relay_key_version,
+            "senderPublicKey": sender_private.public_key_base64(),
+            "senderSigningKey": signing_identity.public_key_base64,
+        }
+
     def seal_message(
         self,
         *,
@@ -945,7 +1058,6 @@ class _RelaySealer:
         if sender_private is None:
             raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
         message_id = secrets.token_hex(16)
-        sym = relay_e2ee.generate_symmetric_key()
         # Sealed payload schema (MP-27): {text, destinationId, threadId?,
         # actionId?, kind?}. The phone decodes this JSON (never renders it raw) and
         # trusts the sealed routing fields over relay-visible top-level metadata.
@@ -956,17 +1068,20 @@ class _RelaySealer:
             payload["actionId"] = action_id
         if kind:
             payload["kind"] = kind
-        payload_ct = relay_e2ee.seal_to_base64(
-            json.dumps(payload).encode("utf-8"),
-            sym,
-            _gateway_message_aad(self._uid, self._client_id, message_id),
-        )
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        message_aad = _gateway_message_aad(self._uid, self._client_id, message_id)
+        key_aad = _gateway_message_key_aad(self._uid, self._client_id, message_id)
+        if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
+            fields = self._seal_signed_v4(
+                peer=peer, sender_private=sender_private, destination_id=destination_id,
+                payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=message_aad,
+            )
+            return {**fields, "messageId": message_id}
+        sym = relay_e2ee.generate_symmetric_key()
+        payload_ct = relay_e2ee.seal_to_base64(payload_bytes, sym, message_aad)
         fields = self._wrap_content_key(
-            peer=peer,
-            key_data=sym,
-            key_aad=_gateway_message_key_aad(self._uid, self._client_id, message_id),
-            sender_private=sender_private,
-            destination_id=destination_id,
+            peer=peer, key_data=sym, key_aad=key_aad,
+            sender_private=sender_private, destination_id=destination_id,
         )
         return {"payloadCiphertext": payload_ct, **fields, "messageId": message_id}
 
@@ -1033,7 +1148,10 @@ class _RelaySealer:
             # Carry the v3 HPKE markers (and eventId/senderPublicKey) up from a
             # flattened event so the version dispatch + enc lookup in
             # _open_envelope can see them.
-            for field in ("enc", "relayEncryption", "relayKeyVersion", "senderPublicKey", "eventId"):
+            for field in (
+                "enc", "relayEncryption", "relayKeyVersion", "senderPublicKey",
+                "senderSig", "senderSigningKey", "eventId",
+            ):
                 if raw.get(field) is not None:
                     envelope[field] = raw.get(field)
         if not isinstance(envelope, dict) or not envelope.get("payloadCiphertext"):
@@ -1100,22 +1218,66 @@ class _RelaySealer:
         event_id = secrets.token_hex(16)
         payload_aad = _gateway_event_aad(self._uid, self._client_id, event_id)
         key_aad = _gateway_event_key_aad(self._uid, self._client_id, event_id)
+        payload_bytes = json.dumps(
+            {"kind": "model_switch", "modelId": model_id, "destinationId": destination_id}
+        ).encode("utf-8")
+        if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
+            fields = self._seal_signed_v4(
+                peer=peer, sender_private=sender_private, destination_id=destination_id,
+                payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=payload_aad,
+            )
+            return {**fields, "eventId": event_id}
         sym = relay_e2ee.generate_symmetric_key()
-        payload_ct = relay_e2ee.seal_to_base64(
-            json.dumps(
-                {"kind": "model_switch", "modelId": model_id, "destinationId": destination_id}
-            ).encode("utf-8"),
-            sym,
-            payload_aad,
-        )
+        payload_ct = relay_e2ee.seal_to_base64(payload_bytes, sym, payload_aad)
         fields = self._wrap_content_key(
-            peer=peer,
-            key_data=sym,
-            key_aad=key_aad,
-            sender_private=sender_private,
-            destination_id=destination_id,
+            peer=peer, key_data=sym, key_aad=key_aad,
+            sender_private=sender_private, destination_id=destination_id,
         )
         return {"payloadCiphertext": payload_ct, **fields, "eventId": event_id}
+
+    def _open_signed_v4(
+        self, raw: dict, envelope: dict, private_key, pinned_phone: str, key_aad: bytes, payload_aad: bytes
+    ) -> bytes:
+        """Open a v4 hardened envelope -> the payload plaintext (Padmé-unpadded).
+
+        Requires the agent signing identity and the PINNED peer signing key (never
+        a wire field). ``relay_e2ee_v4.open_signed_v4`` verifies the Ed25519
+        signature FIRST (fail-closed before the AEAD) and then the HPKE unwrap +
+        AES-GCM open, both bound to the pinned sender keys."""
+        destination_id = str(raw.get("destinationId") or "")
+        peer_signing = self._adapter._peer_signing_key_for(destination_id)
+        signing_identity = self._adapter._ensure_signing_identity()
+        if not peer_signing or signing_identity is None:
+            raise _RelayPlaintextRefused(
+                "refusing a v4 gateway envelope: the agent signing identity and a pinned "
+                "peer signing key are required to open"
+            )
+        relay_encryption = envelope.get("relayEncryption", raw.get("relayEncryption"))
+        if relay_encryption != GATEWAY_RELAY_ENCRYPTION_V4:
+            raise _RelayPlaintextRefused(
+                "refusing a v4 gateway envelope without the v4 relayEncryption marker"
+            )
+        enc = envelope.get("enc") or raw.get("enc")
+        sender_sig = envelope.get("senderSig") or raw.get("senderSig")
+        if not enc or not sender_sig:
+            raise _RelayPlaintextRefused(
+                "refusing a v4 gateway envelope missing its HPKE `enc` or `senderSig`"
+            )
+        v4_envelope = {
+            "enc": enc,
+            "wrappedKey": envelope["wrappedKey"],
+            "payloadCiphertext": envelope["payloadCiphertext"],
+            "senderSig": sender_sig,
+        }
+        return relay_e2ee_v4.open_signed_v4(
+            v4_envelope,
+            recipient_enc_private=private_key,
+            recipient_verify_key=signing_identity.public_key_base64,
+            pinned_sender_enc_public=pinned_phone,
+            pinned_sender_verify_key=peer_signing,
+            key_aad=key_aad,
+            payload_aad=payload_aad,
+        )
 
     def _open_envelope(self, raw: dict, envelope: dict, private_key, payload_aad_builder, key_aad_builder) -> dict:
         """Unwrap + open one sealed envelope, then pin the peer key (TOFU/immutable).
@@ -1157,10 +1319,16 @@ class _RelaySealer:
         # (never the wire senderPublicKey), so a missing pin is refused too.
         if not pinned_phone or version_int not in _OPENABLE_GATEWAY_RELAY_VERSIONS:
             raise _RelayPlaintextRefused(
-                "refusing a non-v2/v3 or unpinned gateway envelope: the authenticated "
+                "refusing a non-v2/v3/v4 or unpinned gateway envelope: the authenticated "
                 "sender pin is required to open"
             )
-        if version_int == GATEWAY_RELAY_KEY_VERSION_V3:
+        if version_int == GATEWAY_RELAY_KEY_VERSION_V4:
+            # v4: Ed25519 explicit signature (against the PINNED peer signing key)
+            # AND the HPKE unwrap must both pass; the signature is checked first.
+            plaintext = self._open_signed_v4(
+                raw, envelope, private_key, pinned_phone, key_aad, payload_aad
+            )
+        elif version_int == GATEWAY_RELAY_KEY_VERSION_V3:
             relay_encryption = envelope.get("relayEncryption", raw.get("relayEncryption"))
             if relay_encryption != GATEWAY_RELAY_ENCRYPTION_V3:
                 raise _RelayPlaintextRefused(
@@ -1175,11 +1343,12 @@ class _RelaySealer:
                 enc, envelope["wrappedKey"], private_key, key_aad,
                 pinned_sender_public=pinned_phone,
             )
+            plaintext = relay_e2ee.open_base64(envelope["payloadCiphertext"], sym, payload_aad)
         else:
             sym = relay_e2ee.unwrap_symmetric_key(
                 envelope["wrappedKey"], private_key, key_aad, sender_public_base64=pinned_phone
             )
-        plaintext = relay_e2ee.open_base64(envelope["payloadCiphertext"], sym, payload_aad)
+            plaintext = relay_e2ee.open_base64(envelope["payloadCiphertext"], sym, payload_aad)
         # MP-21: the wire senderPublicKey is ADVISORY only. The unwrap above already
         # authenticated this frame against the PINNED phone key, so the carried field
         # cannot weaken that proof. We still pass it to _pin_peer_public_key to (a)
@@ -1243,6 +1412,16 @@ class BurnBarAdapter(BasePlatformAdapter):
         # Reserved for future multi-link pairing; today no flow populates it, so
         # every link resolves to ``_peer_relay_key_version_default`` below.
         self._peer_relay_key_versions: Dict[str, int] = {}
+        # --- v4 hardening identities (lazily loaded; see _ensure_relay_identity) ---
+        # The agent's own Ed25519 signing identity (separate from the P-256 relay
+        # key), and the peer's pinned Ed25519 verification key (authenticated at
+        # pairing, bound into the safety code — never a wire field). Both are
+        # required to emit/open the v4 wrap; absent, the link floors to v3/v2.
+        self._signing_identity = None
+        self._peer_signing_key: Optional[str] = (
+            os.getenv(RELAY_PEER_SIGNING_KEY_ENV) or ""
+        ).strip() or None
+        self._peer_signing_keys: Dict[str, str] = {}
         # Replay defense for the current uid/clientId/pinned-peer tuple. A relay
         # can redeliver a valid sealed event; the AAD binds the id, so the bounded
         # digest cache drops normal duplicates, and the sealed replay counter's
@@ -1339,6 +1518,36 @@ class BurnBarAdapter(BasePlatformAdapter):
         # AgentRelayIdentity wraps a RelayPrivateKey; unwrap_symmetric_key needs the
         # inner key (or a raw RelayPrivateKey passed directly in tests).
         return getattr(identity, "private_key", identity)
+
+    def _ensure_signing_identity(self):
+        """Load (or create+persist) the agent's Ed25519 signing identity (v4).
+
+        Persisted to ``~/.hermes/.env`` (0600) like the relay key so it is STABLE
+        across restarts; a corrupt stored key FAILS CLOSED rather than silently
+        rotating (the same policy as the relay key). Returns it or None."""
+        if not RELAY_CRYPTO_AVAILABLE:
+            return None
+        if self._signing_identity is not None:
+            return self._signing_identity
+        persist = self._relay_key_persister()
+        try:
+            self._signing_identity = relay_e2ee_v4.AgentSigningIdentity.load_or_create(
+                env_var=relay_e2ee_v4.RELAY_SIGNING_KEY_ENV, persist=persist
+            )
+        except relay_e2ee.CorruptIdentityError:
+            logger.error(
+                "[%s] corrupt signing key; refusing v4 (re-pair or delete the key)", self.name
+            )
+            raise
+        except Exception:
+            logger.debug("[%s] Could not load signing identity", self.name, exc_info=True)
+            self._signing_identity = None
+        return self._signing_identity
+
+    def _peer_signing_key_for(self, destination_id: str) -> Optional[str]:
+        """The peer's PINNED Ed25519 verification key for one destination (pairing-
+        pinned; never a wire field). Required to emit/open v4."""
+        return self._peer_signing_keys.get(str(destination_id or "")) or self._peer_signing_key
 
     def _relay_public_key_base64(self) -> Optional[str]:
         identity = self._ensure_relay_identity()
@@ -1671,6 +1880,16 @@ class BurnBarAdapter(BasePlatformAdapter):
         version = self._peer_relay_key_versions.get(str(destination_id or ""))
         if version is None:
             version = self._peer_relay_key_version_default
+        # v4 emission additionally requires the agent's signing identity AND the
+        # peer's pinned signing key; without either, fall back to the v3 wrap.
+        if version == GATEWAY_RELAY_KEY_VERSION_V4:
+            if (
+                _gateway_hpke_v4_enabled()
+                and self._ensure_signing_identity() is not None
+                and self._peer_signing_key_for(destination_id)
+            ):
+                return GATEWAY_RELAY_KEY_VERSION_V4
+            version = GATEWAY_RELAY_KEY_VERSION_V3
         if version == GATEWAY_RELAY_KEY_VERSION_V3 and not _gateway_hpke_v3_enabled():
             return GATEWAY_RELAY_KEY_VERSION
         if version in _OPENABLE_GATEWAY_RELAY_VERSIONS:
@@ -1906,6 +2125,9 @@ class BurnBarAdapter(BasePlatformAdapter):
                 body["gatewayRelayEncryption"] = _gateway_relay_encryption_for(preferred_gateway_relay_version)
                 body["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions()
                 body.update(_gateway_relay_capability_payload())
+                signing = self._ensure_signing_identity()
+                if signing is not None:
+                    body["agentRelaySigningKey"] = signing.public_key_base64
         try:
             response = await self._client.post(
                 f"{self._api_base}/runtime",
@@ -2442,6 +2664,7 @@ def interactive_setup() -> None:
     # device/start so the server records the client as E2E-capable. The private
     # key is persisted to ~/.hermes/.env by relay_e2ee; only ciphertext leaves.
     agent_relay_public_key = ""
+    agent_relay_signing_key = ""
     if RELAY_CRYPTO_AVAILABLE:
         try:
             # persist= wires the freshly minted private key to ~/.hermes/.env (0600,
@@ -2455,6 +2678,16 @@ def interactive_setup() -> None:
         except Exception:
             logger.debug("Could not prepare BurnBar relay identity for pairing", exc_info=True)
             agent_relay_public_key = ""
+        try:
+            # The agent's Ed25519 signing identity (v4 explicit auth), advertised so
+            # the peer pins it and binds it into the safety code at pairing.
+            signing_identity = relay_e2ee_v4.AgentSigningIdentity.load_or_create(
+                env_var=relay_e2ee_v4.RELAY_SIGNING_KEY_ENV, persist=save_env_value
+            )
+            agent_relay_signing_key = signing_identity.public_key_base64
+        except Exception:
+            logger.debug("Could not prepare BurnBar signing identity for pairing", exc_info=True)
+            agent_relay_signing_key = ""
 
     device_secret = secrets.token_urlsafe(32)
     payload: Dict[str, Any] = {
@@ -2471,6 +2704,8 @@ def interactive_setup() -> None:
         payload["gatewayRelayEncryption"] = _gateway_relay_encryption_for(preferred_gateway_relay_version)
         payload["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions()
         payload.update(_gateway_relay_capability_payload())
+        if agent_relay_signing_key:
+            payload["agentRelaySigningKey"] = agent_relay_signing_key
     try:
         with httpx.Client(timeout=30) as client:
             start = client.post(f"{api_base}/device/start", json=payload)
@@ -2513,6 +2748,18 @@ def interactive_setup() -> None:
     # (never the untrusted runtime relay path). Floors to v2 unless the grant
     # advertises v3, so a v2-only peer is never auto-upgraded.
     peer_relay_key_version = _peer_relay_key_version_from_pairing_grant(approved, client_payload)
+    # The peer's Ed25519 signing key (v4), from the authenticated grant only.
+    peer_relay_signing_key = (
+        approved.get("phoneRelaySigningKey")
+        or approved.get("relaySigningKey")
+        or client_payload.get("phoneRelaySigningKey")
+        or client_payload.get("relaySigningKey")
+        or ""
+    )
+    # v4 needs the peer's pinned signing key; without it floor the persisted version
+    # to v3 so the link never tries to emit a v4 wrap it cannot sign-verify.
+    if not peer_relay_signing_key and peer_relay_key_version == GATEWAY_RELAY_KEY_VERSION_V4:
+        peer_relay_key_version = GATEWAY_RELAY_KEY_VERSION_V3
     client_id = approved.get("clientId") or client_payload.get("id")
     uid = approved.get("uid") or approved.get("userId")
     if agent_relay_public_key and relay_capable and peer_relay_public_key:
@@ -2528,7 +2775,17 @@ def interactive_setup() -> None:
         # persisting the peer key / enabling E2E. An untrusted relay can substitute
         # the phone key at first pin; the human comparing the combined code (a hash
         # of BOTH keys) on the Mac and in BurnBar is what authenticates it.
-        safety_code = _relay_safety_code(agent_relay_public_key, str(peer_relay_public_key))
+        # Bind ALL pinned keys (encryption + signing) into the safety code when v4
+        # keys are present, so a relay cannot substitute the new signing key while
+        # the human-compared code still matches; otherwise the two-key code.
+        safety_code = ""
+        if agent_relay_signing_key and peer_relay_signing_key:
+            safety_code = _relay_safety_code_v4(
+                agent_relay_public_key, str(peer_relay_public_key),
+                agent_relay_signing_key, str(peer_relay_signing_key),
+            )
+        if not safety_code:
+            safety_code = _relay_safety_code(agent_relay_public_key, str(peer_relay_public_key))
         if not safety_code:
             print_warning(
                 "Could not derive the pairing safety code (invalid relay key). "
@@ -2557,6 +2814,8 @@ def interactive_setup() -> None:
         save_env_value(RELAY_E2E_ENV, "1")
         save_env_value("BURNBAR_RELAY_PEER_PUBLIC_KEY", str(peer_relay_public_key))
         save_env_value(RELAY_PEER_KEY_VERSION_ENV, str(peer_relay_key_version))
+        if peer_relay_signing_key:
+            save_env_value(RELAY_PEER_SIGNING_KEY_ENV, str(peer_relay_signing_key))
         save_env_value("BURNBAR_RELAY_CLIENT_ID", str(client_id))
         save_env_value("BURNBAR_RELAY_UID", str(uid))
         print_success("End-to-end encryption is enabled for this BurnBar link.")
