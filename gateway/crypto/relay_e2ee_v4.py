@@ -185,6 +185,68 @@ def generate_signing_key() -> RelaySigningKey:
     return RelaySigningKey(raw)
 
 
+# Environment variable holding the agent's persistent Ed25519 signing key (base64
+# of the raw 32-byte seed), separate from the P-256 relay encryption key.
+RELAY_SIGNING_KEY_ENV = "BURNBAR_RELAY_SIGNING_KEY"
+
+
+@dataclass(frozen=True)
+class AgentSigningIdentity:
+    """The agent's persistent Ed25519 signing identity.
+
+    The agent publishes ``public_key_base64`` so the peer can pin it, and persists
+    the private seed in ``BURNBAR_RELAY_SIGNING_KEY`` — exactly like
+    :class:`gateway.crypto.relay_e2ee.AgentRelayIdentity` does for the P-256 key.
+    Like that class, a present-but-invalid stored key FAILS CLOSED rather than
+    silently minting a new identity (silent rotation is indistinguishable from a
+    relay key-substitution attack).
+    """
+
+    signing_key: RelaySigningKey
+
+    @property
+    def public_key_base64(self) -> str:
+        return self.signing_key.public_key_base64()
+
+    @classmethod
+    def load_or_create(
+        cls,
+        *,
+        env_var: str = RELAY_SIGNING_KEY_ENV,
+        environ: dict | None = None,
+        persist=None,
+    ) -> "AgentSigningIdentity":
+        import os
+
+        source = environ if environ is not None else os.environ
+        raw_base64 = source.get(env_var)
+        if raw_base64:
+            try:
+                return cls(RelaySigningKey.from_base64(raw_base64.strip()))
+            except (ValueError, relay_e2ee.RelayCryptoError, binascii.Error) as exc:
+                raise relay_e2ee.CorruptIdentityError(
+                    f"{env_var} is present but invalid — re-pair required; "
+                    "refusing to silently rotate the signing identity"
+                ) from exc
+        signing_key = generate_signing_key()
+        minted = signing_key.raw_base64()
+        try:
+            source[env_var] = minted
+        except Exception:
+            pass
+        if persist is not None:
+            try:
+                persist(env_var, minted)
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "signing identity persist callback failed; key kept in-process only",
+                    exc_info=True,
+                )
+        return cls(signing_key)
+
+
 def _coerce_verify_key(value: "RelayVerifyKey | str | bytes") -> RelayVerifyKey:
     if isinstance(value, RelayVerifyKey):
         return value
