@@ -163,6 +163,12 @@ RELAY_PRIVATE_KEY_ENV = "BURNBAR_RELAY_PRIVATE_KEY"
 RELAY_E2E_ENV = "BURNBAR_RELAY_E2E"
 APPROVAL_DECISION_KIND = "approval_decision"
 OVERSIGHT_MODE_KIND = "oversight_mode"
+# Authenticated key-rotation control event (v4): the peer's NEW encryption key,
+# signed by its CURRENT pinned Ed25519 identity key (sign-the-successor).
+KEY_ROTATION_KIND = "key_rotation"
+# The current rotation epoch of the pinned peer encryption key (monotonic). A
+# rotation event must carry from_epoch == this and to_epoch == this + 1.
+RELAY_PEER_KEY_EPOCH_ENV = "BURNBAR_RELAY_PEER_KEY_EPOCH"
 
 
 def _agent_version() -> str:
@@ -1474,6 +1480,12 @@ class BurnBarAdapter(BasePlatformAdapter):
             os.getenv(RELAY_PEER_SIGNING_KEY_ENV) or ""
         ).strip() or None
         self._peer_signing_keys: Dict[str, str] = {}
+        # Monotonic rotation epoch of the pinned peer encryption key. An authenticated
+        # key_rotation event must advance it by exactly 1; the replay high-water is
+        # NOT reset on a swap, so an old frame stays refused across rotation.
+        self._peer_relay_key_epoch: int = _coerce_replay_counter(
+            os.getenv(RELAY_PEER_KEY_EPOCH_ENV)
+        ) or 0
         # Double Ratchet chat-lane sessions (forward secrecy + PCS), keyed by
         # destination id. Loaded from disk so a session survives restart; bootstrapped
         # deterministically from the pinned relay keys on first use (no handshake).
@@ -2160,6 +2172,11 @@ class BurnBarAdapter(BasePlatformAdapter):
                     return
                 self._handle_sealed_oversight_mode(authed)
                 return
+            if kind == KEY_ROTATION_KIND:
+                if not self._record_event(event_id, replay_counter=replay_counter):
+                    return
+                self._handle_sealed_key_rotation(authed)
+                return
             if kind == "model_switch" or authed.get("modelId") is not None:
                 model_id = str(authed.get("modelId") or "").strip()
                 if not _is_safe_model_id(model_id):
@@ -2469,6 +2486,60 @@ class BurnBarAdapter(BasePlatformAdapter):
             save_env_value(OVERSIGHT_MODE_ENV, mode)
         except Exception:
             logger.debug("[%s] Could not persist BurnBar oversight mode", self.name, exc_info=True)
+
+    def _handle_sealed_key_rotation(self, authed: dict) -> None:
+        """Apply an authenticated peer key-rotation event (sign-the-successor).
+
+        The event was already opened through the sealed v4 path (so the relay never
+        saw it in cleartext and could not strip fields); here we verify the detached
+        Ed25519 signature against the PINNED peer identity key, check the monotonic
+        epoch + validity window, and atomically swap the pinned peer encryption key.
+        The replay high-water is intentionally NOT reset, so an old frame stays
+        refused across the rotation."""
+        import base64 as _b64
+
+        if not RELAY_CRYPTO_AVAILABLE:
+            return
+        destination_id = str(authed.get("destinationId") or "")
+        peer_signing = self._peer_signing_key_for(destination_id)
+        if not peer_signing:
+            logger.warning("[%s] dropped key_rotation: no pinned peer signing key", self.name)
+            return
+        try:
+            signed_body = _b64.b64decode(str(authed.get("signedBody") or ""), validate=True)
+            signature = _b64.b64decode(str(authed.get("signature") or ""), validate=True)
+        except Exception:
+            logger.warning("[%s] dropped key_rotation: malformed signedBody/signature", self.name)
+            return
+        try:
+            new_enc = relay_e2ee_v4.verify_rotation_event(
+                signed_body, signature,
+                pinned_identity_verify_key=peer_signing,
+                expected_uid=self._relay_uid, expected_client_id=self._relay_client_id,
+                current_epoch=self._peer_relay_key_epoch, now_ms=int(time.time() * 1000),
+            )
+        except relay_e2ee.RelayCryptoError as exc:
+            logger.warning("[%s] rejected key_rotation: %s", self.name, exc)
+            return
+        new_enc_b64 = _b64.b64encode(new_enc).decode("ascii")
+        self._peer_public_key = new_enc_b64
+        if destination_id:
+            self._peer_public_keys[destination_id] = new_enc_b64
+        self._peer_relay_key_epoch += 1
+        # A new pinned peer key starts a fresh ratchet session lineage; drop any
+        # cached session so the next message re-bootstraps against the new key.
+        self._ratchet_sessions.pop(destination_id, None)
+        persist = self._relay_key_persister()
+        if persist is not None:
+            try:
+                persist("BURNBAR_RELAY_PEER_PUBLIC_KEY", new_enc_b64)
+                persist(RELAY_PEER_KEY_EPOCH_ENV, str(self._peer_relay_key_epoch))
+            except Exception:
+                logger.debug("[%s] could not persist rotated peer key", self.name, exc_info=True)
+        logger.info(
+            "[%s] applied authenticated peer key rotation -> epoch %d",
+            self.name, self._peer_relay_key_epoch,
+        )
 
     async def _resolve_slash_confirm(
         self,

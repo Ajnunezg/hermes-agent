@@ -234,6 +234,55 @@ def test_ratchet_off_by_default_uses_v4_signed(monkeypatch, tmp_path):
 
 
 @requires_relay
+def test_key_rotation_swaps_pinned_peer_key(monkeypatch):
+    """An authenticated key_rotation event (signed by the pinned peer identity key)
+    swaps the pinned peer encryption key and advances the epoch; a replay and a
+    wrong-signer event are rejected."""
+    import base64
+    import time
+
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    assert adapter._peer_relay_key_epoch == 0
+    old_pin = adapter._peer_public_key
+    new_enc = relay_e2ee.generate_private_key()
+    now = int(time.time() * 1000)
+
+    def _event(from_epoch, to_epoch, old_enc, new_enc_priv, signer, nonce):
+        body = v4.build_rotation_signed_body(
+            uid=_UID, client_id=_CLIENT, from_epoch=from_epoch, to_epoch=to_epoch,
+            old_enc_x963=old_enc, new_enc_x963=new_enc_priv.public_key_x963(),
+            not_before_ms=now - 1000, not_after_ms=now + 60000, rotation_nonce=nonce,
+        )
+        return {
+            "kind": "key_rotation", "destinationId": "burnbar:home",
+            "signedBody": base64.b64encode(body).decode(),
+            "signature": base64.b64encode(signer.sign(body)).decode(),
+        }
+
+    # valid rotation signed by the pinned peer identity key
+    adapter._handle_sealed_key_rotation(
+        _event(0, 1, k["phone_enc"].public_key_x963(), new_enc, k["phone_sig"], b"\x22" * 32)
+    )
+    assert adapter._peer_public_key == new_enc.public_key_base64()
+    assert adapter._peer_public_key != old_pin and adapter._peer_relay_key_epoch == 1
+
+    # replay of the same epoch -> rejected (no change)
+    adapter._handle_sealed_key_rotation(
+        _event(0, 1, k["phone_enc"].public_key_x963(), new_enc, k["phone_sig"], b"\x22" * 32)
+    )
+    assert adapter._peer_relay_key_epoch == 1
+
+    # next epoch but signed by an ATTACKER (not the pinned identity) -> rejected
+    attacker = v4.generate_signing_key()
+    adapter._handle_sealed_key_rotation(
+        _event(1, 2, new_enc.public_key_x963(), relay_e2ee.generate_private_key(), attacker, b"\x33" * 32)
+    )
+    assert adapter._peer_relay_key_epoch == 1
+    assert adapter._peer_public_key == new_enc.public_key_base64()
+
+
+@requires_relay
 def test_model_switch_emits_and_opens_v4(monkeypatch):
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, **k)
