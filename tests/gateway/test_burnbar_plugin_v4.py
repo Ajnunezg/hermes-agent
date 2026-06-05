@@ -22,11 +22,13 @@ BurnBarAdapter = _burnbar.BurnBarAdapter
 try:
     from gateway.crypto import relay_e2ee
     from gateway.crypto import relay_e2ee_v4 as v4
+    from gateway.crypto import hermes_ratchet as hr
 
     RELAY_CRYPTO_AVAILABLE = True
 except ImportError:  # pragma: no cover
     relay_e2ee = None
     v4 = None
+    hr = None
     RELAY_CRYPTO_AVAILABLE = False
 
 requires_relay = pytest.mark.skipif(
@@ -174,6 +176,61 @@ def test_floors_to_v3_without_pinned_peer_signing_key(monkeypatch):
     assert adapter._peer_relay_key_version_for("burnbar:home") == 3
     env = adapter._sealer.seal_message(destination_id="burnbar:home", text="v3 fallback")
     assert env["relayKeyVersion"] == 3 and "senderSig" not in env
+
+
+@requires_relay
+def test_ratchet_chat_lane_round_trip(monkeypatch, tmp_path):
+    """With the ratchet opt-in flag, the chat message lane runs through the Double
+    Ratchet (forward secrecy + PCS) end-to-end through the adapter, both directions."""
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "ratchet.json")
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    assert adapter._can_ratchet("burnbar:home")
+    # The phone is the INITIATOR (sends first); the agent is the RESPONDER (replies).
+    phone_pair = hr.HermesRatchetKeyPair(
+        private_key_base64=k["phone_enc"].raw_base64(),
+        public_key_base64=k["phone_enc"].public_key_base64(),
+    )
+    phone = hr.bootstrap_session(
+        role=hr.HermesRatchetRole.INITIATOR, uid=_UID, client_id=_CLIENT,
+        local_ratchet_key_pair=phone_pair, peer_ratchet_public_key_base64=k["agent_enc"].public_key_base64(),
+    )
+    # Before receiving, the agent (responder) has no sending chain -> v4 signed fallback.
+    first = adapter._sealer.seal_message(destination_id="burnbar:home", text="agent-first")
+    assert first["relayKeyVersion"] == 4 and "ratchetEnvelope" not in first
+    # phone -> agent (initiator's first message), opened through open_event's ratchet path.
+    pe = hr.encrypt(json.dumps({"text": "hi from phone"}).encode(), phone)
+    assert adapter._sealer.open_event(
+        {"id": "e1", "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+    ) == {"text": "hi from phone"}
+    # Now the agent has a sending chain -> its reply goes through the ratchet.
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="ratcheted hi")
+    assert "ratchetEnvelope" in env and "wrappedKey" not in env
+    assert json.loads(
+        hr.decrypt(hr.HermesRatchetEnvelope.from_wire(env["ratchetEnvelope"]), phone).decode()
+    ) == {"text": "ratcheted hi", "destinationId": "burnbar:home"}
+    # Several alternations advance the DH ratchet (forward secrecy + PCS).
+    for i in range(3):
+        pe2 = hr.encrypt(json.dumps({"text": f"p{i}"}).encode(), phone)
+        assert adapter._sealer.open_event(
+            {"id": f"e{i}", "destinationId": "burnbar:home", "ratchetEnvelope": pe2.to_wire()}
+        ) == {"text": f"p{i}"}
+        e = adapter._sealer.seal_message(destination_id="burnbar:home", text=f"a{i}")
+        assert json.loads(
+            hr.decrypt(hr.HermesRatchetEnvelope.from_wire(e["ratchetEnvelope"]), phone).decode()
+        )["text"] == f"a{i}"
+
+
+@requires_relay
+def test_ratchet_off_by_default_uses_v4_signed(monkeypatch, tmp_path):
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "ratchet.json")
+    monkeypatch.delenv("BURNBAR_RELAY_RATCHET", raising=False)
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    assert not adapter._can_ratchet("burnbar:home")
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="signed not ratcheted")
+    assert env["relayKeyVersion"] == 4 and "ratchetEnvelope" not in env
 
 
 @requires_relay
