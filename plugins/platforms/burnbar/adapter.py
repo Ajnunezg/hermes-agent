@@ -170,6 +170,10 @@ KEY_ROTATION_KIND = "key_rotation"
 # The current rotation epoch of the pinned peer encryption key (monotonic). A
 # rotation event must carry from_epoch == this and to_epoch == this + 1.
 RELAY_PEER_KEY_EPOCH_ENV = "BURNBAR_RELAY_PEER_KEY_EPOCH"
+# Control-plane kinds. These ALWAYS travel on the v4-signed lane (with the
+# authenticated monotonic replayCounter gate) — never the ratchet chat lane, which
+# carries chat text only. A control kind arriving on the ratchet lane is refused.
+_CONTROL_EVENT_KINDS = frozenset({APPROVAL_DECISION_KIND, OVERSIGHT_MODE_KIND, KEY_ROTATION_KIND, "model_switch"})
 
 
 def _agent_version() -> str:
@@ -1396,6 +1400,20 @@ class _RelaySealer:
                 "refusing a non-v2/v3/v4 or unpinned gateway envelope: the authenticated "
                 "sender pin is required to open"
             )
+        # Anti-downgrade FLOOR: on a link the authenticated pairing grant pinned to
+        # v4, refuse a v2/v3-labeled inbound frame explicitly BEFORE unwrap (a relay
+        # relabeling a v4 frame down to skip the Ed25519 check would otherwise be
+        # rejected only incidentally, by the later Padmé/JSON parse). Break-glass
+        # (v4 disabled) floors the pinned version to v3, so this never fires during
+        # a deliberate rollback.
+        pinned_version = self._adapter._peer_relay_key_version_for(
+            str(raw.get("destinationId") or "")
+        )
+        if pinned_version == GATEWAY_RELAY_KEY_VERSION_V4 and version_int < GATEWAY_RELAY_KEY_VERSION_V4:
+            raise _RelayPlaintextRefused(
+                "refusing a downgraded gateway envelope: this link is pinned to v4 "
+                "(the explicit-signature wrap is required)"
+            )
         if version_int == GATEWAY_RELAY_KEY_VERSION_V4:
             # v4: Ed25519 explicit signature (against the PINNED peer signing key)
             # AND the HPKE unwrap must both pass; the signature is checked first.
@@ -1507,6 +1525,11 @@ class BurnBarAdapter(BasePlatformAdapter):
         # deterministically from the pinned relay keys on first use (no handshake).
         self._ratchet_sessions: Dict[str, Any] = {}
         self._ratchet_sessions_loaded = False
+        # Only the long-running daemon owns the ratchet session store (stateful,
+        # advanced per message). A one-shot standalone send sets this False and
+        # falls back to the v4 signed wrap, so it can never race the daemon on the
+        # session file and reuse a message number (a forward-secrecy break).
+        self._ratchet_allowed = True
         # Replay defense for the current uid/clientId/pinned-peer tuple. A relay
         # can redeliver a valid sealed event; the AAD binds the id, so the bounded
         # digest cache drops normal duplicates, and the sealed replay counter's
@@ -1639,7 +1662,8 @@ class BurnBarAdapter(BasePlatformAdapter):
 
     def _ratchet_enabled(self) -> bool:
         return (
-            RELAY_CRYPTO_AVAILABLE
+            self._ratchet_allowed
+            and RELAY_CRYPTO_AVAILABLE
             and hermes_ratchet is not None
             and (os.getenv(RELAY_RATCHET_ENABLED_ENV) or "").strip() == "1"
         )
@@ -1655,9 +1679,32 @@ class BurnBarAdapter(BasePlatformAdapter):
             and bool(self._peer_relay_public_for(destination_id))
         )
 
+    @staticmethod
+    def _ratchet_session_was_established(session_id: str) -> bool:
+        established = _read_replay_ledger().get("ratchetSessions")
+        return isinstance(established, dict) and bool(established.get(session_id))
+
+    @staticmethod
+    def _mark_ratchet_session_established(session_id: str) -> None:
+        ledger = _read_replay_ledger()
+        established = ledger.get("ratchetSessions")
+        if not isinstance(established, dict):
+            established = {}
+        established[session_id] = True
+        ledger["ratchetSessions"] = established
+        _write_replay_ledger(ledger)
+
     def _ratchet_session(self, destination_id: str):
         """Return the cached/persisted ratchet session for one destination, or
-        bootstrap one deterministically from the pinned relay keys (no handshake)."""
+        bootstrap one deterministically from the pinned relay keys (no handshake).
+
+        Refuses to SILENTLY re-bootstrap a session that was previously established
+        but is missing from the session store (lost/corrupted): the deterministic
+        bootstrap would re-create an identical pristine session and reopen a replay
+        window for any frames a relay recorded. The link then falls back to the v4
+        signed wrap; restoring FS/PCS requires an authenticated key rotation (which
+        yields a new session id), not a silent reset. The "established" marker lives
+        in the replay ledger — a store SEPARATE from the session file."""
         self._load_ratchet_sessions()
         key = str(destination_id or "")
         session = self._ratchet_sessions.get(key)
@@ -1666,6 +1713,18 @@ class BurnBarAdapter(BasePlatformAdapter):
         relay_key = self._relay_private_key()
         peer_pub = self._peer_relay_public_for(destination_id)
         if relay_key is None or not peer_pub:
+            return None
+        session_id = hermes_ratchet.derive_session_id(
+            uid=self._relay_uid, client_id=self._relay_client_id,
+            agent_ratchet_public_key_base64=relay_key.public_key_base64(),
+            peer_ratchet_public_key_base64=peer_pub,
+        )
+        if self._ratchet_session_was_established(session_id):
+            logger.warning(
+                "[%s] ratchet session was lost from the session store; refusing a "
+                "silent re-bootstrap (rotate keys to restore the ratchet chat lane)",
+                self.name,
+            )
             return None
         local_pair = hermes_ratchet.HermesRatchetKeyPair(
             private_key_base64=relay_key.raw_base64(),
@@ -1676,6 +1735,7 @@ class BurnBarAdapter(BasePlatformAdapter):
             uid=self._relay_uid, client_id=self._relay_client_id,
             local_ratchet_key_pair=local_pair, peer_ratchet_public_key_base64=peer_pub,
         )
+        self._mark_ratchet_session_established(session_id)
         self._ratchet_sessions[key] = session
         self._save_ratchet_sessions()
         return session
@@ -2187,19 +2247,33 @@ class BurnBarAdapter(BasePlatformAdapter):
                 logger.warning("[%s] dropped sealed event without authenticated destinationId", self.name)
                 return
             destination_id = sealed_dest or destination_id
-            try:
-                replay_counter = self._sealed_event_replay_counter(authed)
-            except _RelayPlaintextRefused as exc:
-                logger.warning("[%s] dropped sealed event: %s", self.name, exc)
-                return
-            if self._is_replay_counter_seen(replay_counter):
-                logger.info(
-                    "[%s] dropped old sealed event replayCounter=%s highWater=%s",
-                    self.name,
-                    replay_counter,
-                    self._event_replay_high_water,
+            # The Double Ratchet chat lane carries chat text ONLY and has its own
+            # out-of-order-tolerant replay defense (single-use message keys + the
+            # monotonic ratchet message-number chain), so it is exempt from the
+            # v4-signed lane's external monotonic replayCounter gate. Control kinds
+            # must NOT arrive on the ratchet lane (they always use the signed lane
+            # with the counter gate); a control kind here is refused.
+            is_ratchet = isinstance(raw.get("ratchetEnvelope"), dict)
+            if is_ratchet and (kind in _CONTROL_EVENT_KINDS or authed.get("modelId") is not None):
+                logger.warning(
+                    "[%s] dropped control event %r on the ratchet chat lane "
+                    "(control plane must use the v4 signed lane)", self.name, kind or "model_switch"
                 )
                 return
+            if not is_ratchet:
+                try:
+                    replay_counter = self._sealed_event_replay_counter(authed)
+                except _RelayPlaintextRefused as exc:
+                    logger.warning("[%s] dropped sealed event: %s", self.name, exc)
+                    return
+                if self._is_replay_counter_seen(replay_counter):
+                    logger.info(
+                        "[%s] dropped old sealed event replayCounter=%s highWater=%s",
+                        self.name,
+                        replay_counter,
+                        self._event_replay_high_water,
+                    )
+                    return
             if kind == APPROVAL_DECISION_KIND:
                 if not self._record_event(event_id, replay_counter=replay_counter):
                     return
@@ -2215,6 +2289,13 @@ class BurnBarAdapter(BasePlatformAdapter):
                     return
                 self._handle_sealed_key_rotation(authed)
                 return
+            # model_switch is opened as an ordinary sealed event (via open_event)
+            # and dispatched here by kind on the OPENED payload — control kinds are
+            # accepted on the v4-signed lane and re-run their own check (this
+            # _is_safe_model_id, the rotation signature, etc.) independent of the
+            # opener, so lane-moving cannot bypass them. (open_model_switch /
+            # seal_model_switch are reference entrypoints for the clients, not on
+            # this production receive path.)
             if kind == "model_switch" or authed.get("modelId") is not None:
                 model_id = str(authed.get("modelId") or "").strip()
                 if not _is_safe_model_id(model_id):
@@ -2573,6 +2654,11 @@ class BurnBarAdapter(BasePlatformAdapter):
         persist = self._relay_key_persister()
         if persist is not None:
             try:
+                # Persist the new key FIRST, then the epoch. A crash between the two
+                # writes leaves {new_key, epoch=0}, which SELF-HEALS: a replay of the
+                # same authenticated 0->1 rotation re-applies idempotently (swap to
+                # the identical key, epoch -> 1). Writing epoch-first would instead
+                # strand the link at {old_key, epoch=1}, requiring a re-pair.
                 persist("BURNBAR_RELAY_PEER_PUBLIC_KEY", new_enc_b64)
                 persist(RELAY_PEER_KEY_EPOCH_ENV, str(self._peer_relay_key_epoch))
             except Exception:
@@ -2783,6 +2869,10 @@ async def _standalone_send(
     # from ~/.hermes/.env, so the sealer's must_seal/can_seal reflect pairing.
     try:
         adapter = BurnBarAdapter(pconfig if pconfig is not None else PlatformConfig(enabled=True, extra={}))
+        # A one-shot send must not advance the daemon's ratchet sessions (it does not
+        # own them and would race the daemon on the session file) — fall back to the
+        # v4 signed wrap for this send.
+        adapter._ratchet_allowed = False
         sealer: Optional["_RelaySealer"] = adapter._sealer
     except Exception:
         # If the adapter cannot be built but E2E is paired, refusing is the only
@@ -3002,6 +3092,19 @@ def interactive_setup() -> None:
         or client_payload.get("relaySigningKey")
         or ""
     )
+    # Validate the peer signing key: a present-but-INVALID key must not keep the
+    # link v4-pinned (the safety code would then fall back to the two-key form that
+    # omits signing, so the human would confirm a code that doesn't bind the key
+    # actually persisted). Drop an invalid key so the floor + non-persist below fire.
+    if peer_relay_signing_key and RELAY_CRYPTO_AVAILABLE:
+        try:
+            relay_e2ee_v4.RelayVerifyKey.from_base64(str(peer_relay_signing_key))
+        except Exception:
+            print_warning(
+                "BurnBar sent an invalid v4 signing key; falling back to the v3 wrap "
+                "for this link (the safety code will bind the encryption keys only)."
+            )
+            peer_relay_signing_key = ""
     # v4 needs the peer's pinned signing key; without it floor the persisted version
     # to v3 so the link never tries to emit a v4 wrap it cannot sign-verify.
     if not peer_relay_signing_key and peer_relay_key_version == GATEWAY_RELAY_KEY_VERSION_V4:
