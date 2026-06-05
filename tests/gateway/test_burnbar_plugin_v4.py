@@ -55,7 +55,10 @@ def _no_persist(monkeypatch):
     monkeypatch.setattr(_cfg, "save_env_value", lambda *a, **k: None, raising=False)
 
 
-def _paired_v4_adapter(monkeypatch, *, phone_enc, phone_sig, agent_enc, agent_sig, with_peer_signing=True):
+def _paired_v4_adapter(
+    monkeypatch, *, phone_enc, phone_sig, agent_enc, agent_sig,
+    with_peer_signing=True, disable_v4=False, peer_signing_override=None,
+):
     _no_persist(monkeypatch)
     monkeypatch.setenv("BURNBAR_RELAY_E2E", "1")
     monkeypatch.setenv("BURNBAR_RELAY_PEER_PUBLIC_KEY", phone_enc.public_key_base64())
@@ -64,8 +67,13 @@ def _paired_v4_adapter(monkeypatch, *, phone_enc, phone_sig, agent_enc, agent_si
     monkeypatch.setenv("BURNBAR_RELAY_PEER_KEY_VERSION", "4")
     monkeypatch.setenv("BURNBAR_RELAY_SIGNING_KEY", agent_sig.raw_base64())
     monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V3", raising=False)
-    monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V4", raising=False)
-    if with_peer_signing:
+    if disable_v4:
+        monkeypatch.setenv("BURNBAR_DISABLE_GATEWAY_HPKE_V4", "1")
+    else:
+        monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V4", raising=False)
+    if peer_signing_override is not None:
+        monkeypatch.setenv("BURNBAR_RELAY_PEER_SIGNING_KEY", peer_signing_override)
+    elif with_peer_signing:
         monkeypatch.setenv("BURNBAR_RELAY_PEER_SIGNING_KEY", phone_sig.public_key_base64())
     else:
         monkeypatch.delenv("BURNBAR_RELAY_PEER_SIGNING_KEY", raising=False)
@@ -204,6 +212,53 @@ def test_v4_link_refuses_downgraded_v3_frame(monkeypatch):
     }
     with pytest.raises(_burnbar._RelayPlaintextRefused):
         adapter._sealer.open_event(raw)
+
+
+@requires_relay
+def test_break_glass_v4_floors_to_v3_not_v2(monkeypatch):
+    """Break-glass (v4 disabled) degrades a v4-pinned link to v3 — the next-best
+    AUTHENTICATED wrap — not all the way down to v2."""
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, disable_v4=True, **k)
+    assert adapter._peer_relay_key_version_default == 3  # floored to v3 at __init__, not v2
+    assert adapter._peer_relay_key_version_for("burnbar:home") == 3
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="rolled back")
+    assert env["relayKeyVersion"] == 3 and "senderSig" not in env
+
+
+@requires_relay
+def test_invalid_env_peer_signing_key_floors_to_v3(monkeypatch):
+    """A present-but-invalid BURNBAR_RELAY_PEER_SIGNING_KEY is treated as absent at
+    startup (the link floors to v3) rather than failing every v4 send."""
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, peer_signing_override="not~a~valid~ed25519~key", **k)
+    assert adapter._peer_signing_key is None
+    assert adapter._peer_relay_key_version_for("burnbar:home") == 3
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="v3 fallback")
+    assert env["relayKeyVersion"] == 3 and "senderSig" not in env
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_ratchet_delivered_even_if_replay_ledger_record_fails(monkeypatch):
+    """On the ratchet lane the single-use message key is the authoritative replay
+    defense, so a transient replay-ledger persist failure (_record_event False)
+    must NOT lose a message whose ratchet step is already durable."""
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    phone = _phone_initiator(k)
+    monkeypatch.setattr(adapter, "_record_event", lambda *a, **kw: False)
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "survives ledger fail", "destinationId": "burnbar:home"}, "rm-led")
+    )
+    assert len(received) == 1 and received[0].text == "survives ledger fail"
 
 
 @requires_relay
