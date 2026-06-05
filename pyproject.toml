@@ -122,7 +122,7 @@ matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0",
 # here to keep the dependency local to wecom_callback's threat model.
 wecom = ["defusedxml==0.7.1"]
 # Gateway end-to-end relay encryption (gateway/crypto/relay_e2ee.py). Seals
-# BurnBar / PiAgent relay payloads to the peer's P-256 public key so the relay
+# gateway relay payloads to the peer's P-256 public key so the relay
 # server only store-and-forwards ciphertext. `cryptography` is already in
 # uv.lock transitively (alibabacloud/azure deps pin 46.0.7); this extra makes
 # the dependency explicit and lazy-loadable for installs that enable the
