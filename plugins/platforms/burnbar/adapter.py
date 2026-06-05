@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import copy
 import hashlib
 import json
 import logging
@@ -1057,18 +1058,29 @@ class _RelaySealer:
         }
 
     def _seal_ratchet(self, *, destination_id: str, payload_plaintext: bytes, message_id: str) -> dict:
-        """Seal a chat payload through the Double Ratchet (forward secrecy + PCS).
-        The session advances in place and is persisted after each message."""
-        session = self._adapter._ratchet_session(destination_id)
-        if session is None:
+        """Seal a chat payload through the Double Ratchet (forward secrecy + PCS),
+        with Padmé length padding so the relay sees only a size-hidden ciphertext.
+
+        The ratchet advance is persisted BEFORE the envelope is returned (fail-
+        closed): a message is never put on the wire with a ratchet step that is not
+        yet durable, so a crash cannot reuse a message number."""
+        base = self._adapter._ratchet_session(destination_id)
+        if base is None:
             raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
-        env = hermes_ratchet.encrypt(payload_plaintext, session)
-        self._adapter._save_ratchet_sessions()
+        session = copy.deepcopy(base)
+        env = hermes_ratchet.encrypt(relay_e2ee_v4.padme_pad(payload_plaintext), session)
+        if not self._adapter._commit_ratchet_session(destination_id, session):
+            raise _RelayPlaintextRefused(
+                "could not durably persist the ratchet session; refusing to send"
+            )
         return {"ratchetEnvelope": env.to_wire(), "messageId": message_id}
 
     def _open_ratchet(self, raw: dict, ratchet_env: dict) -> Optional[dict]:
-        """Open a Double-Ratchet chat envelope. Transactional decrypt: a forged
-        frame leaves the session unchanged (see hermes_ratchet.decrypt)."""
+        """Open a Double-Ratchet chat envelope. The decrypt is transactional in
+        memory (a forged frame leaves the session unchanged), and the advanced
+        receive state is persisted BEFORE the plaintext is delivered (record-replay-
+        before-side-effect) so a crash cannot reopen a replay window. Padmé padding
+        is stripped after the AEAD."""
         if self._adapter._relay_e2e_config_error:
             raise _RelayPlaintextRefused(self._adapter._relay_e2e_config_error)
         destination_id = str(raw.get("destinationId") or "")
@@ -1076,15 +1088,19 @@ class _RelaySealer:
             if self.must_seal:
                 raise _RelayPlaintextRefused(self._inbound_plaintext_refusal_reason("event"))
             return None
-        session = self._adapter._ratchet_session(destination_id)
-        if session is None:
+        base = self._adapter._ratchet_session(destination_id)
+        if base is None:
             raise _RelayPlaintextRefused(
                 "a ratchet session is required to open this event but none is available"
             )
         envelope = hermes_ratchet.HermesRatchetEnvelope.from_wire(ratchet_env)
+        session = copy.deepcopy(base)
         plaintext = hermes_ratchet.decrypt(envelope, session)
-        self._adapter._save_ratchet_sessions()
-        decoded = json.loads(plaintext.decode("utf-8"))
+        if not self._adapter._commit_ratchet_session(destination_id, session):
+            raise _RelayPlaintextRefused(
+                "could not durably persist the ratchet session; refusing to deliver"
+            )
+        decoded = json.loads(relay_e2ee_v4.padme_unpad(plaintext).decode("utf-8"))
         return decoded if isinstance(decoded, dict) else {"text": str(decoded)}
 
     def seal_message(
@@ -1678,10 +1694,13 @@ class BurnBarAdapter(BasePlatformAdapter):
             except Exception:
                 continue
 
-    def _save_ratchet_sessions(self) -> None:
-        """Persist ratchet sessions (0600) so a session survives restart. The file
-        holds the full ratchet state including chain keys, so it is written with the
-        same secrecy as the relay key store."""
+    def _save_ratchet_sessions(self) -> bool:
+        """Persist ratchet sessions (0600, atomic replace) so a session survives
+        restart. The file holds the full ratchet state including chain keys, so it
+        is written with the same secrecy as the relay key store. Returns True on a
+        durable write — callers FAIL CLOSED on False so a message is never sent or
+        delivered with a ratchet advance that is not yet on disk (which would risk a
+        message-number reuse on send or a replay window on receive after a crash)."""
         try:
             RATCHET_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
             data = {k: v.to_wire() for k, v in self._ratchet_sessions.items()}
@@ -1689,11 +1708,30 @@ class BurnBarAdapter(BasePlatformAdapter):
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
                 os.write(fd, json.dumps(data).encode("utf-8"))
+                os.fsync(fd)
             finally:
                 os.close(fd)
             os.replace(tmp, RATCHET_SESSION_FILE)
+            return True
         except Exception:
-            logger.debug("[%s] could not persist ratchet sessions", self.name, exc_info=True)
+            logger.warning("[%s] could not persist ratchet sessions", self.name, exc_info=True)
+            return False
+
+    def _commit_ratchet_session(self, destination_id: str, session) -> bool:
+        """Atomically commit an advanced session: persist it to disk FIRST, and only
+        on a durable write update the in-memory cache. On a persist failure the
+        cache is left at the prior state so the caller can fail closed and a later
+        retry re-derives from the durable state (no message-number reuse / replay)."""
+        key = str(destination_id or "")
+        prior = self._ratchet_sessions.get(key)
+        self._ratchet_sessions[key] = session
+        if self._save_ratchet_sessions():
+            return True
+        if prior is None:
+            self._ratchet_sessions.pop(key, None)
+        else:
+            self._ratchet_sessions[key] = prior
+        return False
 
     def _relay_public_key_base64(self) -> Optional[str]:
         identity = self._ensure_relay_identity()
@@ -2526,9 +2564,12 @@ class BurnBarAdapter(BasePlatformAdapter):
         if destination_id:
             self._peer_public_keys[destination_id] = new_enc_b64
         self._peer_relay_key_epoch += 1
-        # A new pinned peer key starts a fresh ratchet session lineage; drop any
-        # cached session so the next message re-bootstraps against the new key.
-        self._ratchet_sessions.pop(destination_id, None)
+        # A new pinned peer key starts a fresh ratchet session lineage; drop the
+        # cached AND persisted session so the next message re-bootstraps against the
+        # new key (and a crash before then cannot resurrect the stale session).
+        self._load_ratchet_sessions()
+        if self._ratchet_sessions.pop(destination_id, None) is not None:
+            self._save_ratchet_sessions()
         persist = self._relay_key_persister()
         if persist is not None:
             try:

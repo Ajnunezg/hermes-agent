@@ -178,6 +178,103 @@ def test_floors_to_v3_without_pinned_peer_signing_key(monkeypatch):
     assert env["relayKeyVersion"] == 3 and "senderSig" not in env
 
 
+def _establish_ratchet(monkeypatch, adapter, k):
+    """Bootstrap the phone (initiator) session and send its first message so the
+    agent (responder) gains a sending chain. Returns the phone session."""
+    phone_pair = hr.HermesRatchetKeyPair(
+        private_key_base64=k["phone_enc"].raw_base64(),
+        public_key_base64=k["phone_enc"].public_key_base64(),
+    )
+    phone = hr.bootstrap_session(
+        role=hr.HermesRatchetRole.INITIATOR, uid=_UID, client_id=_CLIENT,
+        local_ratchet_key_pair=phone_pair, peer_ratchet_public_key_base64=k["agent_enc"].public_key_base64(),
+    )
+    pe = hr.encrypt(v4.padme_pad(json.dumps({"text": "hello"}).encode()), phone)
+    adapter._sealer.open_event(
+        {"id": "e0", "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+    )
+    return phone
+
+
+@requires_relay
+def test_ratchet_chat_is_padme_length_padded(monkeypatch, tmp_path):
+    """Ratchet chat messages are Padmé-padded (size hidden from the relay), and the
+    on-wire ciphertext length is exactly padded-plaintext + nonce + tag."""
+    import base64
+
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "r.json")
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    phone = _establish_ratchet(monkeypatch, adapter, k)
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="a")
+    payload = json.dumps({"text": "a", "destinationId": "burnbar:home"}).encode()
+    expected_padded = len(v4.padme_pad(payload))
+    ct = base64.b64decode(env["ratchetEnvelope"]["ciphertextBase64"])
+    assert len(ct) == 12 + expected_padded + 16  # nonce(12) + padded plaintext + GCM tag(16)
+    # and it still round-trips (the phone strips the padding)
+    opened = v4.padme_unpad(
+        hr.decrypt(hr.HermesRatchetEnvelope.from_wire(env["ratchetEnvelope"]), phone)
+    )
+    assert json.loads(opened) == {"text": "a", "destinationId": "burnbar:home"}
+
+
+@requires_relay
+def test_ratchet_send_fails_closed_when_persist_fails(monkeypatch, tmp_path):
+    """If the ratchet session cannot be durably persisted, the send is REFUSED and
+    the in-memory session is left unchanged (no advance leaks onto the wire)."""
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "r.json")
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    _establish_ratchet(monkeypatch, adapter, k)
+    before = adapter._ratchet_sessions["burnbar:home"].to_wire()
+    monkeypatch.setattr(adapter, "_save_ratchet_sessions", lambda: False)
+    with pytest.raises(_burnbar._RelayPlaintextRefused):
+        adapter._sealer.seal_message(destination_id="burnbar:home", text="never durable")
+    assert adapter._ratchet_sessions["burnbar:home"].to_wire() == before  # unchanged
+
+
+@requires_relay
+def test_ratchet_open_fails_closed_when_persist_fails(monkeypatch, tmp_path):
+    """A received ratchet frame is NOT delivered if its advanced state cannot be
+    persisted (record-replay-before-side-effect), and the session is unchanged."""
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "r.json")
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    phone = _establish_ratchet(monkeypatch, adapter, k)
+    before = adapter._ratchet_sessions["burnbar:home"].to_wire()
+    pe = hr.encrypt(v4.padme_pad(json.dumps({"text": "x"}).encode()), phone)
+    monkeypatch.setattr(adapter, "_save_ratchet_sessions", lambda: False)
+    with pytest.raises(_burnbar._RelayPlaintextRefused):
+        adapter._sealer.open_event(
+            {"id": "e9", "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+        )
+    assert adapter._ratchet_sessions["burnbar:home"].to_wire() == before
+
+
+@requires_relay
+def test_ratchet_session_survives_restart(monkeypatch, tmp_path):
+    """The persisted session is reloaded by a fresh adapter (survives restart) and
+    continues the conversation without desync."""
+    monkeypatch.setattr(_burnbar, "RATCHET_SESSION_FILE", tmp_path / "r.json")
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    phone = _establish_ratchet(monkeypatch, adapter, k)
+    env = adapter._sealer.seal_message(destination_id="burnbar:home", text="before restart")
+    assert v4.padme_unpad(
+        hr.decrypt(hr.HermesRatchetEnvelope.from_wire(env["ratchetEnvelope"]), phone)
+    ) == json.dumps({"text": "before restart", "destinationId": "burnbar:home"}).encode()
+    # A fresh adapter (same env, same session file) reloads the session from disk.
+    fresh = _paired_v4_adapter(monkeypatch, **k)
+    pe = hr.encrypt(v4.padme_pad(json.dumps({"text": "after restart"}).encode()), phone)
+    assert fresh._sealer.open_event(
+        {"id": "e1", "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+    ) == {"text": "after restart"}
+
+
 @requires_relay
 def test_ratchet_chat_lane_round_trip(monkeypatch, tmp_path):
     """With the ratchet opt-in flag, the chat message lane runs through the Double
@@ -199,27 +296,30 @@ def test_ratchet_chat_lane_round_trip(monkeypatch, tmp_path):
     # Before receiving, the agent (responder) has no sending chain -> v4 signed fallback.
     first = adapter._sealer.seal_message(destination_id="burnbar:home", text="agent-first")
     assert first["relayKeyVersion"] == 4 and "ratchetEnvelope" not in first
+
+    def phone_send(text):  # the phone Padmé-pads, exactly like the agent does
+        return hr.encrypt(v4.padme_pad(json.dumps({"text": text}).encode()), phone).to_wire()
+
+    def phone_open(wire):  # strip the agent's Padmé padding after decrypt
+        return json.loads(
+            v4.padme_unpad(hr.decrypt(hr.HermesRatchetEnvelope.from_wire(wire), phone))
+        )
+
     # phone -> agent (initiator's first message), opened through open_event's ratchet path.
-    pe = hr.encrypt(json.dumps({"text": "hi from phone"}).encode(), phone)
     assert adapter._sealer.open_event(
-        {"id": "e1", "destinationId": "burnbar:home", "ratchetEnvelope": pe.to_wire()}
+        {"id": "e1", "destinationId": "burnbar:home", "ratchetEnvelope": phone_send("hi from phone")}
     ) == {"text": "hi from phone"}
     # Now the agent has a sending chain -> its reply goes through the ratchet.
     env = adapter._sealer.seal_message(destination_id="burnbar:home", text="ratcheted hi")
     assert "ratchetEnvelope" in env and "wrappedKey" not in env
-    assert json.loads(
-        hr.decrypt(hr.HermesRatchetEnvelope.from_wire(env["ratchetEnvelope"]), phone).decode()
-    ) == {"text": "ratcheted hi", "destinationId": "burnbar:home"}
+    assert phone_open(env["ratchetEnvelope"]) == {"text": "ratcheted hi", "destinationId": "burnbar:home"}
     # Several alternations advance the DH ratchet (forward secrecy + PCS).
     for i in range(3):
-        pe2 = hr.encrypt(json.dumps({"text": f"p{i}"}).encode(), phone)
         assert adapter._sealer.open_event(
-            {"id": f"e{i}", "destinationId": "burnbar:home", "ratchetEnvelope": pe2.to_wire()}
+            {"id": f"e{i}", "destinationId": "burnbar:home", "ratchetEnvelope": phone_send(f"p{i}")}
         ) == {"text": f"p{i}"}
         e = adapter._sealer.seal_message(destination_id="burnbar:home", text=f"a{i}")
-        assert json.loads(
-            hr.decrypt(hr.HermesRatchetEnvelope.from_wire(e["ratchetEnvelope"]), phone).decode()
-        )["text"] == f"a{i}"
+        assert phone_open(e["ratchetEnvelope"])["text"] == f"a{i}"
 
 
 @requires_relay
