@@ -324,9 +324,23 @@ def test_break_glass_disables_v3_emission(monkeypatch):
 @requires_relay
 def test_capability_payload_advertises_v3_by_default(monkeypatch):
     monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V3", raising=False)
+    monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V4", raising=False)
     cap = _burnbar._gateway_relay_capability_payload()
     assert cap["supportsHpkeV3"] is True
     assert 3 in cap["supportsRelayEnvelopeVersions"]
+    # v4 (the hardened wrap) is also advertised by default, so it is preferred; v3
+    # stays in the supported set so a v3-only peer can negotiate down to it.
+    assert cap["preferredRelayEnvelopeVersion"] == 4
+    assert cap["supportsHpkeV4"] is True
+
+
+@requires_relay
+def test_capability_payload_v3_preferred_when_v4_disabled(monkeypatch):
+    monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V3", raising=False)
+    monkeypatch.setenv("BURNBAR_DISABLE_GATEWAY_HPKE_V4", "1")
+    cap = _burnbar._gateway_relay_capability_payload()
+    assert cap["supportsHpkeV3"] is True and cap["supportsHpkeV4"] is False
+    assert cap["supportsRelayEnvelopeVersions"] == [2, 3]
     assert cap["preferredRelayEnvelopeVersion"] == 3
 
 
