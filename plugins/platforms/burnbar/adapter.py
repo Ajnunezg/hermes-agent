@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - Hermes installs httpx in core.
 try:
     from gateway.crypto import relay_e2ee
     from gateway.crypto import relay_e2ee_v4
+    from gateway.crypto import hermes_ratchet
 
     RELAY_CRYPTO_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only when cryptography is absent.
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - exercised only when cryptography is ab
     RELAY_CRYPTO_AVAILABLE = False
     relay_e2ee = None  # type: ignore[assignment]
     relay_e2ee_v4 = None  # type: ignore[assignment]
+    hermes_ratchet = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -140,6 +142,14 @@ RELAY_PEER_SIGNING_KEY_ENV = "BURNBAR_RELAY_PEER_SIGNING_KEY"
 # (HPKE_V3_DISABLED) or to forbid v4 emission (V4_DISABLED) in an emergency.
 GATEWAY_HPKE_V3_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V3"
 GATEWAY_HPKE_V4_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V4"
+# Opt-in: route the CHAT message lane through the Double Ratchet (forward secrecy
+# + post-compromise security) instead of the per-message v4 signed wrap. Requires
+# a v4-negotiated link. Off by default so the conservative v4 signed envelope is
+# the baseline; control events (model_switch, approvals) always use the v4 wrap.
+RELAY_RATCHET_ENABLED_ENV = "BURNBAR_RELAY_RATCHET"
+RATCHET_SESSION_FILE = Path(
+    os.getenv("HERMES_BURNBAR_RATCHET_FILE", "~/.hermes/cache/burnbar_ratchet_sessions.json")
+).expanduser()
 # Single-source the AAD namespace from relay_e2ee. RelayNamespace.aad(parts)
 # yields the locked wire bytes "OpenBurnBar-HermesRelay-v1|" + "|".join(parts);
 # we reuse it with the gateway-flavoured parts so the prefix/version is never
@@ -1040,6 +1050,37 @@ class _RelaySealer:
             "senderSigningKey": signing_identity.public_key_base64,
         }
 
+    def _seal_ratchet(self, *, destination_id: str, payload_plaintext: bytes, message_id: str) -> dict:
+        """Seal a chat payload through the Double Ratchet (forward secrecy + PCS).
+        The session advances in place and is persisted after each message."""
+        session = self._adapter._ratchet_session(destination_id)
+        if session is None:
+            raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
+        env = hermes_ratchet.encrypt(payload_plaintext, session)
+        self._adapter._save_ratchet_sessions()
+        return {"ratchetEnvelope": env.to_wire(), "messageId": message_id}
+
+    def _open_ratchet(self, raw: dict, ratchet_env: dict) -> Optional[dict]:
+        """Open a Double-Ratchet chat envelope. Transactional decrypt: a forged
+        frame leaves the session unchanged (see hermes_ratchet.decrypt)."""
+        if self._adapter._relay_e2e_config_error:
+            raise _RelayPlaintextRefused(self._adapter._relay_e2e_config_error)
+        destination_id = str(raw.get("destinationId") or "")
+        if not self._adapter._can_ratchet(destination_id):
+            if self.must_seal:
+                raise _RelayPlaintextRefused(self._inbound_plaintext_refusal_reason("event"))
+            return None
+        session = self._adapter._ratchet_session(destination_id)
+        if session is None:
+            raise _RelayPlaintextRefused(
+                "a ratchet session is required to open this event but none is available"
+            )
+        envelope = hermes_ratchet.HermesRatchetEnvelope.from_wire(ratchet_env)
+        plaintext = hermes_ratchet.decrypt(envelope, session)
+        self._adapter._save_ratchet_sessions()
+        decoded = json.loads(plaintext.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else {"text": str(decoded)}
+
     def seal_message(
         self,
         *,
@@ -1069,6 +1110,14 @@ class _RelaySealer:
         if kind:
             payload["kind"] = kind
         payload_bytes = json.dumps(payload).encode("utf-8")
+        if self._adapter._can_ratchet(destination_id):
+            session = self._adapter._ratchet_session(destination_id)
+            # The responder (agent) has no sending chain until it receives the
+            # initiator's first message; until then, fall back to the v4 signed wrap.
+            if session is not None and session.sending_chain_key_base64 is not None:
+                return self._seal_ratchet(
+                    destination_id=destination_id, payload_plaintext=payload_bytes, message_id=message_id
+                )
         message_aad = _gateway_message_aad(self._uid, self._client_id, message_id)
         key_aad = _gateway_message_key_aad(self._uid, self._client_id, message_id)
         if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
@@ -1136,6 +1185,9 @@ class _RelaySealer:
         Raises :class:`_RelayPlaintextRefused` when E2E is required but the event
         is unsealed.
         """
+        ratchet_env = raw.get("ratchetEnvelope")
+        if isinstance(ratchet_env, dict):
+            return self._open_ratchet(raw, ratchet_env)
         envelope = raw.get("relayEnvelope")
         if not isinstance(envelope, dict):
             envelope = None
@@ -1422,6 +1474,11 @@ class BurnBarAdapter(BasePlatformAdapter):
             os.getenv(RELAY_PEER_SIGNING_KEY_ENV) or ""
         ).strip() or None
         self._peer_signing_keys: Dict[str, str] = {}
+        # Double Ratchet chat-lane sessions (forward secrecy + PCS), keyed by
+        # destination id. Loaded from disk so a session survives restart; bootstrapped
+        # deterministically from the pinned relay keys on first use (no handshake).
+        self._ratchet_sessions: Dict[str, Any] = {}
+        self._ratchet_sessions_loaded = False
         # Replay defense for the current uid/clientId/pinned-peer tuple. A relay
         # can redeliver a valid sealed event; the AAD binds the id, so the bounded
         # digest cache drops normal duplicates, and the sealed replay counter's
@@ -1548,6 +1605,83 @@ class BurnBarAdapter(BasePlatformAdapter):
         """The peer's PINNED Ed25519 verification key for one destination (pairing-
         pinned; never a wire field). Required to emit/open v4."""
         return self._peer_signing_keys.get(str(destination_id or "")) or self._peer_signing_key
+
+    def _peer_relay_public_for(self, destination_id: str) -> Optional[str]:
+        return self._peer_public_keys.get(str(destination_id or "")) or self._peer_public_key
+
+    def _ratchet_enabled(self) -> bool:
+        return (
+            RELAY_CRYPTO_AVAILABLE
+            and hermes_ratchet is not None
+            and (os.getenv(RELAY_RATCHET_ENABLED_ENV) or "").strip() == "1"
+        )
+
+    def _can_ratchet(self, destination_id: str) -> bool:
+        """True when the CHAT lane should use the Double Ratchet: opt-in flag set,
+        the link negotiated v4, and the agent + pinned-peer relay keys (reused as
+        the ratchet bootstrap identities) are present."""
+        return (
+            self._ratchet_enabled()
+            and self._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4
+            and self._relay_private_key() is not None
+            and bool(self._peer_relay_public_for(destination_id))
+        )
+
+    def _ratchet_session(self, destination_id: str):
+        """Return the cached/persisted ratchet session for one destination, or
+        bootstrap one deterministically from the pinned relay keys (no handshake)."""
+        self._load_ratchet_sessions()
+        key = str(destination_id or "")
+        session = self._ratchet_sessions.get(key)
+        if session is not None:
+            return session
+        relay_key = self._relay_private_key()
+        peer_pub = self._peer_relay_public_for(destination_id)
+        if relay_key is None or not peer_pub:
+            return None
+        local_pair = hermes_ratchet.HermesRatchetKeyPair(
+            private_key_base64=relay_key.raw_base64(),
+            public_key_base64=relay_key.public_key_base64(),
+        )
+        session = hermes_ratchet.bootstrap_session(
+            role=hermes_ratchet.HermesRatchetRole.RESPONDER,  # the agent replies to the user
+            uid=self._relay_uid, client_id=self._relay_client_id,
+            local_ratchet_key_pair=local_pair, peer_ratchet_public_key_base64=peer_pub,
+        )
+        self._ratchet_sessions[key] = session
+        self._save_ratchet_sessions()
+        return session
+
+    def _load_ratchet_sessions(self) -> None:
+        if self._ratchet_sessions_loaded:
+            return
+        self._ratchet_sessions_loaded = True
+        try:
+            raw = json.loads(RATCHET_SESSION_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for key, wire in (raw or {}).items():
+            try:
+                self._ratchet_sessions[str(key)] = hermes_ratchet.HermesRatchetSessionState.from_wire(wire)
+            except Exception:
+                continue
+
+    def _save_ratchet_sessions(self) -> None:
+        """Persist ratchet sessions (0600) so a session survives restart. The file
+        holds the full ratchet state including chain keys, so it is written with the
+        same secrecy as the relay key store."""
+        try:
+            RATCHET_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = {k: v.to_wire() for k, v in self._ratchet_sessions.items()}
+            tmp = RATCHET_SESSION_FILE.with_name(f"{RATCHET_SESSION_FILE.name}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(data).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, RATCHET_SESSION_FILE)
+        except Exception:
+            logger.debug("[%s] could not persist ratchet sessions", self.name, exc_info=True)
 
     def _relay_public_key_base64(self) -> Optional[str]:
         identity = self._ensure_relay_identity()
