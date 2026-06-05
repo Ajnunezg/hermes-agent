@@ -336,6 +336,92 @@ def responder_state(
     )
 
 
+_SESSION_ID_DOMAIN = b"OpenBurnBar-HermesRatchet-v1-session"
+_DEVICE_ID_DOMAIN = b"OpenBurnBar-HermesRatchet-v1-device"
+_BOOTSTRAP_INFO = b"OpenBurnBar-HermesRatchet-v1-root-bootstrap"
+
+
+def derive_session_id(
+    *, uid: str, client_id: str, agent_ratchet_public_key_base64: str, peer_ratchet_public_key_base64: str
+) -> str:
+    """A deterministic, role-free session id from the routing ids + both pinned
+    ratchet identity keys (sorted), so both sides derive the IDENTICAL id."""
+    low, high = sorted(
+        (_b64decode(agent_ratchet_public_key_base64, "agentRatchet"),
+         _b64decode(peer_ratchet_public_key_base64, "peerRatchet"))
+    )
+    return sha256(
+        _SESSION_ID_DOMAIN + b"|" + uid.encode("utf-8") + b"|" + client_id.encode("utf-8") + b"|" + low + high
+    ).hexdigest()
+
+
+def derive_device_id(ratchet_public_key_base64: str) -> str:
+    return sha256(_DEVICE_ID_DOMAIN + b"|" + _b64decode(ratchet_public_key_base64, "ratchetPub")).hexdigest()[:32]
+
+
+def bootstrap_session(
+    *,
+    role: HermesRatchetRole,
+    uid: str,
+    client_id: str,
+    local_ratchet_key_pair: HermesRatchetKeyPair,
+    peer_ratchet_public_key_base64: str,
+    max_skip: int = DEFAULT_MAX_SKIP,
+    max_skipped_keys: int = DEFAULT_MAX_SKIPPED_KEYS,
+) -> HermesRatchetSessionState:
+    """Deterministically establish a session from the PINNED ratchet identity keys
+    — no stateful handshake round-trip.
+
+    The initial root key is ``HKDF(ECDH(local_ratchet, peer_ratchet))`` (symmetric,
+    so both sides derive it identically) and the session/device ids are
+    deterministic functions of the pinned keys + routing ids. ``role`` is the
+    caller's fixed role: the agent is the **responder** (it replies to the user)
+    and the user's device is the **initiator** (it sends first). The Double Ratchet
+    then provides forward secrecy (from the first message) and post-compromise
+    security (after the first DH-ratchet round-trip). The bootstrap DH is static-
+    static, so the ROOT key has no forward secrecy on its own; the ratchet heals
+    this on the first round-trip. The RESPONDER has no sending chain until it
+    receives the initiator's first message — callers (e.g. an agent that wants to
+    send first) fall back to the v4 signed wrap until then. The pinned ratchet
+    identity keys are authenticated at pairing (bound into the all-key safety
+    code), so a relay cannot seed the session.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    local_pub = local_ratchet_key_pair.public_key_base64
+    peer_pub = peer_ratchet_public_key_base64
+    if _b64decode(local_pub, "localRatchet") == _b64decode(peer_pub, "peerRatchet"):
+        raise InvalidPublicKeyError("ratchet identity keys must differ between peers")
+    session_id = derive_session_id(
+        uid=uid, client_id=client_id,
+        agent_ratchet_public_key_base64=local_pub, peer_ratchet_public_key_base64=peer_pub,
+    )
+    local_device = derive_device_id(local_pub)
+    peer_device = derive_device_id(peer_pub)
+    local_private = _private_key_from_base64(local_ratchet_key_pair.private_key_base64)
+    peer_public = _public_key_from_base64(peer_pub)
+    dh = _shared_secret_bytes(local_private, peer_public)
+    shared_secret = HKDF(
+        algorithm=hashes.SHA256(), length=_SYMMETRIC_KEY_BYTES, salt=b"\x00" * 32,
+        info=_BOOTSTRAP_INFO + b"|" + session_id.encode("ascii"),
+    ).derive(dh)
+
+    if role == HermesRatchetRole.INITIATOR:
+        # Initiator: ratchet against the RESPONDER's ratchet identity key (the peer).
+        return initiator_state(
+            session_id=session_id, local_device_id=local_device, remote_device_id=peer_device,
+            shared_secret=shared_secret, remote_initial_ratchet_public_key_base64=peer_pub,
+            max_skip=max_skip, max_skipped_keys=max_skipped_keys,
+        )
+    # Responder: use OUR ratchet identity keypair as the initial ratchet key.
+    return responder_state(
+        session_id=session_id, local_device_id=local_device, remote_device_id=peer_device,
+        shared_secret=shared_secret, local_initial_ratchet_key_pair=local_ratchet_key_pair,
+        max_skip=max_skip, max_skipped_keys=max_skipped_keys,
+    )
+
+
 def encrypt(
     plaintext: bytes,
     state: HermesRatchetSessionState,
@@ -731,6 +817,9 @@ __all__ = [
     "random_root_key",
     "initiator_state",
     "responder_state",
+    "bootstrap_session",
+    "derive_session_id",
+    "derive_device_id",
     "encrypt",
     "decrypt",
     "envelope_aad",
