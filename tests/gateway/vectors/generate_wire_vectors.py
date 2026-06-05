@@ -3,8 +3,9 @@
 This module is the single, self-contained source of truth for the two
 known-answer vectors the Python relay-crypto suite opens:
 
-  * ``tests/gateway/fixtures/HermesRelayWireVector.json``   (v1 realtime relay)
-  * ``tests/gateway/fixtures/HermesGatewayWireVector.json`` (v2 authenticated gateway)
+  * ``tests/gateway/fixtures/HermesRelayWireVector.json``     (v1 realtime relay)
+  * ``tests/gateway/fixtures/HermesGatewayWireVector.json``   (v2 authenticated gateway)
+  * ``tests/gateway/fixtures/HermesGatewayWireVectorV3.json`` (v3 RFC 9180 HPKE Auth)
 
 It seals fixed plaintexts under fixed static keypairs, fixed symmetric keys,
 fixed ephemeral keys, and fixed nonces, so the exact ciphertext bytes are
@@ -47,6 +48,7 @@ from gateway.crypto import relay_e2ee
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 RELAY_VECTOR_PATH = _FIXTURES / "HermesRelayWireVector.json"
 GATEWAY_VECTOR_PATH = _FIXTURES / "HermesGatewayWireVector.json"
+GATEWAY_V3_VECTOR_PATH = _FIXTURES / "HermesGatewayWireVectorV3.json"
 
 # Order of the NIST P-256 prime-order group (for deriving in-range ephemerals).
 _P256_GROUP_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -67,6 +69,15 @@ _GATEWAY_ATTACHMENT_OUTPUT_FIELDS = (
     "recipientPublicKey", "senderPublicKey",
     "manifestAAD", "bodyAAD", "keyAAD",
     "manifestCiphertext", "bodyCiphertext", "wrappedKey",
+)
+# v3 adds the RFC 9180 HPKE encapsulated key (``enc``) and the explicit version
+# markers (``relayKeyVersion`` 3, ``relayEncryption`` = the HPKE suite id) to each
+# slot's outputs; the payload/attachment AES-GCM layers are byte-unchanged.
+_GATEWAY_V3_PAYLOAD_OUTPUT_FIELDS = _GATEWAY_PAYLOAD_OUTPUT_FIELDS + (
+    "enc", "relayKeyVersion", "relayEncryption",
+)
+_GATEWAY_V3_ATTACHMENT_OUTPUT_FIELDS = _GATEWAY_ATTACHMENT_OUTPUT_FIELDS + (
+    "enc", "relayKeyVersion", "relayEncryption",
 )
 
 # AAD labels + id field per gateway payload slot. modelSwitch deliberately reuses
@@ -263,6 +274,98 @@ def build_gateway_vector(spec: dict) -> dict:
     return out
 
 
+def build_gateway_v3_vector(spec: dict) -> dict:
+    """Recompute the v3 (RFC 9180 HPKE Auth-mode) gateway vector from ``spec``.
+
+    Identical inputs and slot/sender mapping to :func:`build_gateway_vector`, but
+    the content-key wrap is the standard HPKE ``mode_auth`` wrap
+    (:func:`relay_e2ee.wrap_symmetric_key_v3`), so each slot additionally carries
+    the HPKE ``enc`` (encapsulated key) and the ``relayKeyVersion`` 3 /
+    ``relayEncryption`` markers. The payload / manifest / body AES-256-GCM layers
+    are byte-identical to v2 — v3 only changes how the content key is wrapped.
+    """
+    ns = _ns()
+    out = dict(spec)
+    out["algorithm"] = relay_e2ee.HPKE_ALGORITHM
+    out["keyVersion"] = relay_e2ee.HPKE_KEY_VERSION
+    out["revision"] = "v3"
+
+    priv_a = spec["event"]["recipientPrivateKey"]      # agent static private key
+    priv_b = spec["message"]["recipientPrivateKey"]    # phone static private key
+    sender_priv_by_slot = {
+        "event": priv_b, "modelSwitch": priv_b,        # phone -> agent
+        "message": priv_a, "attachment": priv_a,       # agent -> phone
+    }
+
+    with _deterministic():
+        for slot in ("event", "message", "modelSwitch"):
+            s = spec[slot]
+            uid, client = s["uid"], s["clientId"]
+            payload_label, key_label, id_field = _GATEWAY_PAYLOAD_LABELS[slot]
+            obj_id = s[id_field]
+            recipient = relay_e2ee.RelayPrivateKey.from_base64(s["recipientPrivateKey"])
+            sender = relay_e2ee.RelayPrivateKey.from_base64(sender_priv_by_slot[slot])
+            recipient_pub = recipient.public_key_base64()
+            sym = base64.b64decode(s["symmetricKey"])
+            payload_pt = base64.b64decode(s["encodedPlaintext"])
+            payload_aad = ns.aad([payload_label, uid, client, obj_id])
+            key_aad = ns.aad([key_label, uid, client, obj_id])
+
+            payload_ct = relay_e2ee.seal_to_base64(payload_pt, sym, payload_aad)
+            wrap = relay_e2ee.wrap_symmetric_key_v3(
+                sym, recipient_pub, key_aad, sender_private=sender
+            )
+            outputs = {
+                "recipientPublicKey": recipient_pub,
+                "senderPublicKey": sender.public_key_base64(),
+                "payloadAAD": payload_aad.decode("utf-8"),
+                "keyAAD": key_aad.decode("utf-8"),
+                "payloadCiphertext": payload_ct,
+                "wrappedKey": wrap.wrapped_key,
+                "enc": wrap.enc,
+                "relayKeyVersion": wrap.relay_key_version,
+                "relayEncryption": wrap.relay_encryption,
+            }
+            _assert_output_fields(outputs, _GATEWAY_V3_PAYLOAD_OUTPUT_FIELDS, f"gateway-v3 {slot}")
+            out[slot] = {**s, **outputs}
+
+        a = spec["attachment"]
+        uid, client, aid = a["uid"], a["clientId"], a["attachmentId"]
+        recipient = relay_e2ee.RelayPrivateKey.from_base64(a["recipientPrivateKey"])
+        sender = relay_e2ee.RelayPrivateKey.from_base64(sender_priv_by_slot["attachment"])
+        recipient_pub = recipient.public_key_base64()
+        body_key = base64.b64decode(a["bodyKey"])
+        manifest_aad = ns.aad(["gatewayAttachmentManifest", uid, client, aid])
+        body_aad = ns.aad(["gatewayAttachmentBody", uid, client, aid])
+        key_aad = ns.aad(["gatewayAttachmentKey", uid, client, aid])
+
+        manifest_ct = relay_e2ee.seal_to_base64(
+            a["manifestPlaintext"].encode("utf-8"), body_key, manifest_aad
+        )
+        body_ct = relay_e2ee.seal_to_base64(
+            a["bodyPlaintext"].encode("utf-8"), body_key, body_aad
+        )
+        wrap = relay_e2ee.wrap_symmetric_key_v3(
+            body_key, recipient_pub, key_aad, sender_private=sender
+        )
+        outputs = {
+            "recipientPublicKey": recipient_pub,
+            "senderPublicKey": sender.public_key_base64(),
+            "manifestAAD": manifest_aad.decode("utf-8"),
+            "bodyAAD": body_aad.decode("utf-8"),
+            "keyAAD": key_aad.decode("utf-8"),
+            "manifestCiphertext": manifest_ct,
+            "bodyCiphertext": body_ct,
+            "wrappedKey": wrap.wrapped_key,
+            "enc": wrap.enc,
+            "relayKeyVersion": wrap.relay_key_version,
+            "relayEncryption": wrap.relay_encryption,
+        }
+        _assert_output_fields(outputs, _GATEWAY_V3_ATTACHMENT_OUTPUT_FIELDS, "gateway-v3 attachment")
+        out["attachment"] = {**a, **outputs}
+    return out
+
+
 def _load(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -277,6 +380,7 @@ def regenerate() -> dict[str, dict]:
     return {
         str(RELAY_VECTOR_PATH): build_relay_vector(_load(RELAY_VECTOR_PATH)),
         str(GATEWAY_VECTOR_PATH): build_gateway_vector(_load(GATEWAY_VECTOR_PATH)),
+        str(GATEWAY_V3_VECTOR_PATH): build_gateway_v3_vector(_load(GATEWAY_V3_VECTOR_PATH)),
     }
 
 
@@ -287,7 +391,11 @@ def _main(argv: list[str]) -> int:
     group.add_argument("--check", action="store_true", help="verify the committed fixtures reproduce")
     args = parser.parse_args(argv)
 
-    targets = ((RELAY_VECTOR_PATH, build_relay_vector), (GATEWAY_VECTOR_PATH, build_gateway_vector))
+    targets = (
+        (RELAY_VECTOR_PATH, build_relay_vector),
+        (GATEWAY_VECTOR_PATH, build_gateway_vector),
+        (GATEWAY_V3_VECTOR_PATH, build_gateway_v3_vector),
+    )
     drift = False
     for path, builder in targets:
         regenerated = builder(_load(path))
