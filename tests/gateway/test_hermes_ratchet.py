@@ -203,6 +203,37 @@ def test_session_state_wire_round_trip():
     assert hr.decrypt(e, reloaded) == b"persist me"
 
 
+def test_bootstrap_session_is_symmetric_and_round_trips():
+    """Both sides bootstrap matching responder/initiator sessions from the PINNED
+    ratchet identity keys with no handshake; the initiator sends first, then both
+    alternate with forward secrecy + PCS."""
+    agent_id = hr.generate_key_pair()   # agent = responder (replies)
+    phone_id = hr.generate_key_pair()   # phone = initiator (sends first)
+    agent = hr.bootstrap_session(
+        role=hr.HermesRatchetRole.RESPONDER, uid="u", client_id="c",
+        local_ratchet_key_pair=agent_id, peer_ratchet_public_key_base64=phone_id.public_key_base64,
+    )
+    phone = hr.bootstrap_session(
+        role=hr.HermesRatchetRole.INITIATOR, uid="u", client_id="c",
+        local_ratchet_key_pair=phone_id, peer_ratchet_public_key_base64=agent_id.public_key_base64,
+    )
+    assert agent.session_id == phone.session_id
+    assert {agent.role, phone.role} == {hr.HermesRatchetRole.INITIATOR, hr.HermesRatchetRole.RESPONDER}
+    for i in range(6):
+        assert hr.decrypt(hr.encrypt(f"p{i}".encode(), phone), agent) == f"p{i}".encode()
+        assert hr.decrypt(hr.encrypt(f"a{i}".encode(), agent), phone) == f"a{i}".encode()
+    assert agent.epoch >= 5 and phone.epoch >= 5  # DH ratchet advanced
+
+
+def test_bootstrap_rejects_identical_identity_keys():
+    same = hr.generate_key_pair()
+    with pytest.raises(hr.InvalidPublicKeyError):
+        hr.bootstrap_session(
+            role=hr.HermesRatchetRole.INITIATOR, uid="u", client_id="c",
+            local_ratchet_key_pair=same, peer_ratchet_public_key_base64=same.public_key_base64,
+        )
+
+
 def test_envelope_aad_is_deterministic_and_length_prefixed():
     h = hr.HermesRatchetHeader(
         session_id="s", sender_device_id="a", receiver_device_id="b",
