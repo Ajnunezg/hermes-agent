@@ -2,7 +2,7 @@
 
 Run (writes ``tests/gateway/fixtures/BurnBarHpkeV3Vector.json``)::
 
-    cd /Users/albertonunez/.hermes/hermes-agent
+    cd <hermes-agent checkout>
     venv/bin/python -m tests.gateway.vectors.generate_burnbar_hpke_v3_vectors
 
 The vectors are byte-reproducible review fixtures: static recipient/sender

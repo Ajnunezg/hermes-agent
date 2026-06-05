@@ -77,3 +77,10 @@ Python, Swift, and Kotlin. The generator and tests cover positive message/event/
 attachment/model-switch payloads plus required negatives: wrong destination,
 wrong recipient, replay rollback, missing sender public key, swapped `enc`,
 downgrade, and payload-policy rejection.
+
+See [`HPKE_V3_PROOF.md`](HPKE_V3_PROOF.md) for the frozen v3 wire contract, the
+canonical fixture hash, the exact test matrix, and the companion Swift/Kotlin
+verification commands. That proof note is intentionally scoped: v3 proves a
+standards-shaped authenticated content-key wrap for peers that negotiate it; it
+does not claim Signal-grade forward secrecy, post-compromise security, metadata
+privacy, or live production rollout on every gateway flow.

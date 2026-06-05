@@ -1,9 +1,9 @@
 # BurnBar HPKE v3 cross-language vectors (test lane)
 
-Canonical vector suite + RFC 9180 reference that prove the BurnBar phone (Swift)
-and the Hermes agent (Python) agree byte-for-byte on the `relayKeyVersion == 3`
-relay **content-key wrap**. This directory is **test tooling / a conformance
-oracle** — never imported by production.
+Canonical vector suite + RFC 9180 reference that prove the BurnBar phone (Swift),
+BurnBar Android (Kotlin/JCE), and the Hermes agent (Python) agree byte-for-byte
+on the `relayKeyVersion == 3` relay **content-key wrap**. This directory is
+**test tooling / a conformance oracle** - never imported by production.
 
 ## Frozen v3 contract
 
@@ -28,28 +28,39 @@ byte-for-byte.
   `hashlib`/`hmac` + `cryptography` EC/AEAD). Includes `run_self_test()`.
 - `generate_burnbar_hpke_v3_vectors.py` — fixture generator.
 - `../fixtures/BurnBarHpkeV3Vector.json` — the canonical fixture (5 positives,
-  9 negatives). Vendored byte-identical into the Swift test bundle at
-  `OpenBurnBarCore/Tests/OpenBurnBarCoreTests/Fixtures/BurnBarHpkeV3Vector.json`.
+  13 negatives). Vendored byte-identical into the Swift test bundle at
+  `OpenBurnBarCore/Tests/OpenBurnBarCoreTests/Fixtures/BurnBarHpkeV3Vector.json`
+  and the Android test resources at
+  `android/app/src/test/resources/hermes-relay/HermesGatewayWireVectorV3.json`.
 - `../test_burnbar_hpke_v3_vectors.py` — the Python verifier (opens positives,
   rejects negatives, cross-checks the production `relay_e2ee` v3 path).
 - `OpenBurnBarCore/.../BurnBarHpkeV3CrossPlatformVectorTests.swift` — Swift
   CryptoKit opens the same fixture.
+- `android/.../HermesRelayCryptoHpkeV3Test.kt` — Android opens the same fixture.
 
 ## Regenerate
 
 ```bash
-cd /Users/albertonunez/.hermes/hermes-agent
+cd <hermes-agent checkout>
 venv/bin/python -m tests.gateway.vectors.generate_burnbar_hpke_v3_vectors
-# then re-vendor the Swift copy:
+# then mirror the exact JSON bytes into the companion app test resources:
 cp tests/gateway/fixtures/BurnBarHpkeV3Vector.json \
-   /Users/albertonunez/Documents/Windsurf/BurnBar/OpenBurnBarCore/Tests/OpenBurnBarCoreTests/Fixtures/
+  <BurnBar checkout>/OpenBurnBarCore/Tests/OpenBurnBarCoreTests/Fixtures/BurnBarHpkeV3Vector.json
+cp tests/gateway/fixtures/BurnBarHpkeV3Vector.json \
+  <BurnBar checkout>/android/app/src/test/resources/hermes-relay/HermesGatewayWireVectorV3.json
 ```
 
-Static recipient/sender keypairs and per-case content keys are **deterministic**
-(stable, reviewable, aligned with the Swift deterministic fixture scheme); each
-HPKE `enc` uses a **fresh random ephemeral** exactly as production does. These
-are *open-verification* vectors: regenerating yields a fresh **valid** fixture,
-not identical bytes — verifiers open them rather than diffing them.
+Static recipient/sender keypairs, per-case content keys, HPKE Auth ephemerals,
+and payload AES-GCM nonces are **deterministic in the fixture only**. Production
+still generates fresh HPKE ephemerals and AES-GCM nonces. Determinism makes the
+review artifact reproducible: regenerating the fixture must produce the exact
+same semantic JSON object and the mirrored fixture hash must stay stable.
+
+Current canonical fixture hash:
+
+```text
+sha256 04ebb743b0f6df75cfa5602c18f311fe289aa6186a6e3fa86ddc39021aae936f
+```
 
 ## Cross-language proof (triangulated)
 
@@ -58,18 +69,21 @@ not identical bytes — verifiers open them rather than diffing them.
    reference, and `wrap/unwrap_symmetric_key_v3` open it (bidirectional).
 3. Swift **CryptoKit** (`HPKE.Ciphersuite.P256_SHA256_AES_GCM_256`, auth mode) —
    a third independent RFC 9180 implementation — opens it.
+4. Android's production Kotlin/JCE implementation opens the same fixture and
+   asserts the same destination/replay schema on JSON payloads.
 
-Three independent implementations agreeing is the byte-agreement guarantee.
+The proof is not just "Python seals, Python opens": the committed verifier pins
+the RFC 9180 known-answer vector, regenerates the canonical fixture, opens every
+positive case, rejects every negative, and checks production Python against the
+reference in both directions.
 
 ## Coordination / handoff
 
-- **Owner:** the vector/tests lane. Adds test tooling + fixtures only; it does
-  **not** modify `relay_e2ee.py`, `HermesRelayCrypto.swift`, or the adapter.
-- **Preferred emitter:** once the Swift `HermesRelayCrypto` v3 wrap/open lands,
-  Swift becomes the canonical generator (a Swift-emitted fixture proves the
-  phone and agent agree on bytes); regenerate from Swift and re-vendor the
-  Python copy. Until then this Python-reference fixture is the handoff and the
-  permanent independent cross-check.
-- **Kotlin/Android:** when the Android v3 port lands, replay this same fixture
-  through the Kotlin implementation. Do **not** overwrite vendored copies
-  without the owning lane regenerating from its canonical emitter.
+- **Owner:** the vector/tests lane. The Python RFC 9180 reference is the
+  canonical fixture generator for this upstream Hermes PR.
+- **Mirror rule:** all companion app copies must be byte-identical to
+  `tests/gateway/fixtures/BurnBarHpkeV3Vector.json`; mirror drift is a test
+  failure, not an acceptable reformat.
+- **Swift/Kotlin:** both companion implementations consume this fixture. Swift
+  also has a separate read-only fixture-emission test for handoff/debugging, but
+  it does not overwrite the canonical fixture by default.

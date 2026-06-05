@@ -11,7 +11,8 @@ message the agent — and supervise it — from the BurnBar iOS/macOS apps.
   messages to the agent.
 - **Replies** via `/messages` and **typing** state via `/typing`.
 - **Attachments** via `/attachments/init` + signed upload + `/attachments/finalize`.
-- **End-to-end relay encryption** (`p256-hkdf-sha256-aesgcm`, via
+- **End-to-end relay encryption** (`p256-hkdf-sha256-aesgcm` v2 and RFC 9180
+  HPKE Auth v3, via
   `gateway.crypto.relay_e2ee`): once the paired phone publishes a relay public
   key, the adapter seals every outgoing reply body / attachment to the phone's key
   and opens phone-sealed inbound events with its own key; on an E2E-paired link it
@@ -73,9 +74,20 @@ From the Hermes repo root:
 # runtime status + model switch, and the relay seal -> open round-trip.
 scripts/run_tests.sh tests/gateway/test_burnbar_plugin.py tests/gateway/test_relay_e2ee.py
 
+# HPKE v3 RFC 9180 proof surface: reference vectors, production Python parity,
+# adapter v3 negotiation/open gates, and downgrade/strip negatives.
+venv/bin/python -m pytest \
+  tests/gateway/test_relay_e2ee_v3.py \
+  tests/gateway/test_burnbar_plugin_v3.py \
+  tests/gateway/test_burnbar_hpke_v3_vectors.py -q
+
 # Deterministic smoke against a fake gateway (copies the plugin into a checkout).
 python plugins/platforms/burnbar/smoke_local.py smoke --hermes-repo .
 ```
+
+For the full v3 wire contract, fixture hash, non-claims, and companion
+Swift/Kotlin verification commands, see
+[`HPKE_V3_PROOF.md`](HPKE_V3_PROOF.md).
 
 ## Manual full-gateway local test
 
