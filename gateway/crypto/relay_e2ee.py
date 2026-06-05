@@ -73,11 +73,15 @@ domain-separated ``info`` (which binds the namespace version and, for v2, all
 three public keys) supplies the separation an explicit salt would otherwise
 provide. It is not a weakness.
 
-**Why not RFC 9180 HPKE?** v2 is HPKE-AuthEncap-shaped, but it is not HPKE
-wire framing. The project keeps this bespoke frame only because the Swift,
-Kotlin, and Python clients already share byte-exact CryptoKit-compatible vectors
-and gateway envelopes. A future standard-HPKE migration must be a new
-``relayKeyVersion`` with new vectors; do not silently mutate the v2 layout.
+**Versions.** v1 (anonymous 1-DH) and v2 (authenticated 2-DH, HPKE-AuthEncap-
+shaped but bespoke wire framing) are retained byte-unchanged so the existing
+Swift / Kotlin / Python clients keep opening the committed vectors and gateway
+envelopes. ``relayKeyVersion = 3`` is the standards path: RFC 9180 HPKE
+``mode_auth`` over ``DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256 + AES-256-GCM``
+(:func:`wrap_symmetric_key_v3` / :func:`unwrap_symmetric_key_v3`), with its own
+committed known-answer vectors anchored to the RFC's Appendix-A test vector. v3
+is purely additive — it wraps only the 32-byte content key and leaves the v1/v2
+layout and the payload/attachment AES-256-GCM layers untouched.
 
 **Trust anchor.** The v2 sender-auth property holds ONLY because the caller
 passes the **pinned** peer static key to :func:`unwrap_symmetric_key`
@@ -90,6 +94,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import os
 from dataclasses import dataclass
 
@@ -99,6 +105,12 @@ from dataclasses import dataclass
 
 ALGORITHM = "p256-hkdf-sha256-aesgcm"
 KEY_VERSION = 1
+
+# RFC 9180 HPKE Auth-mode suite identifier and wire markers for the v3 key-wrap.
+# v3 wraps only the 32-byte content key with HPKE; the payload / attachment
+# AES-256-GCM sealing layers are unchanged from v1/v2.
+HPKE_ALGORITHM = "hpke-auth-p256-hkdfsha256-aes256gcm"
+HPKE_KEY_VERSION = 3
 
 # Default namespace. ``HERMES_NAMESPACE`` mirrors Swift ``HermesRelayCrypto``
 # (AAD prefix ``OpenBurnBar-HermesRelay-v1`` / key-wrap info prefix
@@ -120,6 +132,28 @@ _P256_COORDINATE_BYTE_COUNT = 32
 # ValueError deep inside an ECDH call.
 _P256_GROUP_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 _HKDF_SALT = b"\x00" * 32  # RFC 5869 empty-salt -> HashLen zero bytes; matches Swift salt: Data()
+
+# RFC 9180 §7 suite IDs for the v3 HPKE Auth-mode content-key wrap:
+# DHKEM(P-256, HKDF-SHA256) [0x0010] + HKDF-SHA256 [0x0001] + AES-256-GCM [0x0002].
+_HPKE_KEM_ID = 0x0010
+_HPKE_KDF_ID = 0x0001
+_HPKE_AEAD_ID = 0x0002
+_HPKE_NH = 32  # HKDF-SHA256 output length
+_HPKE_NK = 32  # AES-256-GCM key length
+_HPKE_NN = 12  # AES-256-GCM nonce length
+_HPKE_AUTH_MODE = 0x02  # RFC 9180 mode_auth
+_HPKE_VERSION_LABEL = b"HPKE-v1"
+_HPKE_KEM_SUITE_ID = b"KEM" + _HPKE_KEM_ID.to_bytes(2, "big")
+_HPKE_SUITE_ID = (
+    b"HPKE"
+    + _HPKE_KEM_ID.to_bytes(2, "big")
+    + _HPKE_KDF_ID.to_bytes(2, "big")
+    + _HPKE_AEAD_ID.to_bytes(2, "big")
+)
+# Domain-separation prefix for the v3 HPKE ``info``, parallel to the v1/v2
+# key-wrap info prefixes. ``-HPKE-v3`` binds the envelope version into the HPKE
+# key schedule so a v3 wrap can never collide with the v1/v2 schemes.
+_HPKE_INFO_PREFIX = b"OpenBurnBar-HermesRelay-HPKE-v3|"
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +186,23 @@ class CorruptIdentityError(RelayCryptoError):
     indistinguishable from a relay key-substitution attack). Re-pairing — or
     explicitly clearing the env var — is required to recover.
     """
+
+
+@dataclass(frozen=True)
+class RelayKeyWrapV3:
+    """RFC 9180 HPKE Auth-mode key-wrap envelope fields (relay v3).
+
+    ``enc`` is the HPKE encapsulated key (P-256 X9.63 uncompressed point,
+    base64). ``wrapped_key`` is the HPKE ciphertext+tag over the 32-byte content
+    key (base64). The payload and attachment AES-256-GCM layers are unchanged
+    from v1/v2. ``relay_encryption`` / ``relay_key_version`` are the wire markers
+    a recipient uses to dispatch the v3 opener.
+    """
+
+    enc: str
+    wrapped_key: str
+    relay_encryption: str = HPKE_ALGORITHM
+    relay_key_version: int = HPKE_KEY_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +411,65 @@ class RelayPrivateKey:
         return base64.b64encode(self.raw_representation).decode("ascii")
 
 
+@dataclass(frozen=True)
+class RelayPublicKey:
+    """A P-256 relay public key (X9.63 uncompressed, 65 bytes ``0x04 ‖ X ‖ Y``).
+
+    The public counterpart of :class:`RelayPrivateKey`. Stores the canonical
+    65-byte uncompressed point so the bytes match Swift ``publicKeyBase64`` /
+    CryptoKit ``x963Representation`` exactly. Like :class:`RelayPrivateKey`, the
+    ``cryptography`` ``EllipticCurvePublicKey`` is derived lazily so merely
+    *holding* a public key never forces the C extension to load; full on-curve
+    validation happens the first time the key is used (:meth:`_public_key`).
+
+    Added for the typed RFC 9180 HPKE v3 key-wrap helpers below, which take
+    explicit recipient / pinned-sender public keys. The byte-stable v1/v2 paths
+    continue to accept base64 strings and are unaffected by this additive type.
+    """
+
+    x963_representation: bytes
+
+    def __post_init__(self) -> None:
+        raw = self.x963_representation
+        if len(raw) != _X963_PUBLIC_KEY_BYTE_COUNT or raw[0] != 0x04:
+            raise InvalidPublicKeyError(
+                "relay public key must be a 65-byte X9.63 uncompressed P-256 point"
+            )
+
+    @classmethod
+    def from_raw(cls, raw: bytes) -> "RelayPublicKey":
+        """Import from the raw 65-byte X9.63 uncompressed point."""
+        return cls(bytes(raw))
+
+    @classmethod
+    def from_base64(cls, public_key_base64: str) -> "RelayPublicKey":
+        """Import from base64 of the X9.63 uncompressed point."""
+        try:
+            return cls(base64.b64decode(public_key_base64, validate=True))
+        except (ValueError, binascii.Error) as exc:
+            raise InvalidPublicKeyError("relay public key is invalid") from exc
+
+    def _public_key(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        try:
+            return ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), self.x963_representation
+            )
+        except ValueError as exc:
+            raise InvalidPublicKeyError(
+                "relay public key is not a valid P-256 point"
+            ) from exc
+
+    def public_key_x963(self) -> bytes:
+        """The canonical X9.63 uncompressed public key bytes (65B, ``0x04`` prefix)."""
+        return self.x963_representation
+
+    def public_key_base64(self) -> str:
+        """Base64 of the X9.63 uncompressed public key (mirrors Swift ``publicKeyBase64``)."""
+        return base64.b64encode(self.x963_representation).decode("ascii")
+
+
 def generate_private_key() -> RelayPrivateKey:
     """Generate a fresh P-256 relay private key. Mirrors Swift ``generatePrivateKey``."""
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -530,6 +640,89 @@ def _hkdf_wrapping_key(
 ) -> bytes:
     """v1 wrapping key: ``info = "<ns>-KeyWrap-v1|" + aad`` (byte-unchanged)."""
     return _hkdf_derive(shared_secret, namespace.key_wrap_shared_info(aad))
+
+
+# ---------------------------------------------------------------------------
+# RFC 9180 labeled-KDF / DHKEM / key-schedule primitives (v3 HPKE only).
+#
+# These re-implement RFC 9180 §4 (LabeledExtract/LabeledExpand), §4.1 (DHKEM
+# ExtractAndExpand) and §5.1 (KeySchedule) directly from the spec on top of the
+# stdlib ``hmac``/``hashlib`` HKDF, because the ``cryptography`` HKDF helper
+# couples Extract+Expand and so cannot express the per-step labeled calls HPKE
+# requires. They are exercised against the RFC's own Appendix-A known-answer
+# vector in ``tests/gateway/test_relay_e2ee_v3.py``
+# (``test_production_hpke_primitives_match_rfc9180_kat``).
+# ---------------------------------------------------------------------------
+
+
+def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """HKDF-Extract with SHA-256 (RFC 5869). Empty salt -> HashLen zero bytes."""
+    if not salt:
+        salt = b"\x00" * _HPKE_NH
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-Expand with SHA-256 (RFC 5869)."""
+    if length < 0 or length > 255 * _HPKE_NH:
+        raise ValueError("invalid HKDF length")
+    okm = b""
+    previous = b""
+    counter = 1
+    while len(okm) < length:
+        previous = hmac.new(
+            prk, previous + info + bytes([counter]), hashlib.sha256
+        ).digest()
+        okm += previous
+        counter += 1
+    return okm[:length]
+
+
+def _hpke_labeled_extract(
+    suite_id: bytes, salt: bytes, label: bytes, ikm: bytes
+) -> bytes:
+    return _hkdf_extract(salt, _HPKE_VERSION_LABEL + suite_id + label + ikm)
+
+
+def _hpke_labeled_expand(
+    suite_id: bytes, prk: bytes, label: bytes, info: bytes, length: int
+) -> bytes:
+    labeled_info = (
+        length.to_bytes(2, "big")
+        + _HPKE_VERSION_LABEL
+        + suite_id
+        + label
+        + info
+    )
+    return _hkdf_expand(prk, labeled_info, length)
+
+
+def _hpke_extract_and_expand(dh: bytes, kem_context: bytes) -> bytes:
+    """RFC 9180 §4.1 DHKEM ExtractAndExpand for DHKEM(P-256, HKDF-SHA256)."""
+    eae_prk = _hpke_labeled_extract(_HPKE_KEM_SUITE_ID, b"", b"eae_prk", dh)
+    return _hpke_labeled_expand(
+        _HPKE_KEM_SUITE_ID, eae_prk, b"shared_secret", kem_context, _HPKE_NH
+    )
+
+
+def _hpke_auth_key_schedule(shared_secret: bytes, info: bytes) -> tuple[bytes, bytes]:
+    """RFC 9180 §5.1 KeySchedule for ``mode_auth`` (no PSK) -> ``(key, base_nonce)``."""
+    psk_id_hash = _hpke_labeled_extract(_HPKE_SUITE_ID, b"", b"psk_id_hash", b"")
+    info_hash = _hpke_labeled_extract(_HPKE_SUITE_ID, b"", b"info_hash", info)
+    key_schedule_context = bytes([_HPKE_AUTH_MODE]) + psk_id_hash + info_hash
+    secret = _hpke_labeled_extract(_HPKE_SUITE_ID, shared_secret, b"secret", b"")
+    key = _hpke_labeled_expand(
+        _HPKE_SUITE_ID, secret, b"key", key_schedule_context, _HPKE_NK
+    )
+    base_nonce = _hpke_labeled_expand(
+        _HPKE_SUITE_ID, secret, b"base_nonce", key_schedule_context, _HPKE_NN
+    )
+    return key, base_nonce
+
+
+def _hpke_info(aad: bytes) -> bytes:
+    """The HPKE ``info`` for a v3 wrap: ``"OpenBurnBar-HermesRelay-HPKE-v3|" + aad``."""
+    return _HPKE_INFO_PREFIX + aad
 
 
 def _public_key_x963_from_base64(public_key_base64: str) -> bytes:
@@ -728,3 +921,180 @@ def unwrap_symmetric_key(
         wrapping_key = _hkdf_derive(ikm, info)
 
     return AESGCM(wrapping_key).decrypt(body[:_NONCE_BYTE_COUNT], body[_NONCE_BYTE_COUNT:], aad)
+
+
+# ---------------------------------------------------------------------------
+# RFC 9180 HPKE Auth-mode v3 key-wrap
+# Suite: DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256 + AES-256-GCM, mode_auth.
+# HPKE wraps ONLY the 32-byte content key; the payload/attachment AES-256-GCM
+# sealing layers (`seal_to_base64` / `open_base64`) are unchanged. The DHKEM /
+# key-schedule / labeled-KDF primitives above are RFC 9180 §4-§5; these two
+# helpers are the single-shot SealAuth/OpenAuth wrappers the gateway calls.
+# ---------------------------------------------------------------------------
+
+
+def _hpke_auth_encap(recipient_public, sender_private, *, ephemeral_private=None):
+    """RFC 9180 §6.1 DHKEM(P-256) ``AuthEncap`` -> ``(shared_secret, enc)``.
+
+    ``recipient_public`` / ``sender_private`` are ``cryptography`` EC key objects.
+    ``dh = DH(skE, pkR) ‖ DH(skS, pkR)`` (ephemeral leg first, concat never XOR)
+    and ``kem_context = enc ‖ pkRm ‖ pkSm`` exactly per the RFC. ``ephemeral_private``
+    is injectable ONLY for known-answer tests; production generates a fresh
+    ephemeral keypair per call (forward secrecy for the ephemeral leg).
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    if ephemeral_private is None:
+        ephemeral_private = ec.generate_private_key(ec.SECP256R1())
+    enc = ephemeral_private.public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint
+    )
+    dh = ephemeral_private.exchange(ec.ECDH(), recipient_public) + sender_private.exchange(
+        ec.ECDH(), recipient_public
+    )
+    pk_rm = recipient_public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    pk_sm = sender_private.public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint
+    )
+    kem_context = enc + pk_rm + pk_sm
+    shared_secret = _hpke_extract_and_expand(dh, kem_context)
+    return shared_secret, enc
+
+
+def _hpke_auth_decap(enc, recipient_private, sender_public):
+    """RFC 9180 §6.1 DHKEM(P-256) ``AuthDecap`` -> ``shared_secret``.
+
+    Binds ``sender_public`` (the PINNED peer key) as the authenticated sender:
+    ``dh = DH(skR, pkE) ‖ DH(skR, pkS)``. A wrong/forged sender key changes
+    ``dh`` (and therefore the shared secret), so the downstream AES-256-GCM open
+    fails the tag.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    try:
+        ephemeral_public = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), enc
+        )
+    except ValueError as exc:
+        raise InvalidPublicKeyError(
+            "HPKE v3 encapsulated key is not a valid P-256 point"
+        ) from exc
+    dh = recipient_private.exchange(ec.ECDH(), ephemeral_public) + recipient_private.exchange(
+        ec.ECDH(), sender_public
+    )
+    pk_rm = recipient_private.public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint
+    )
+    pk_sm = sender_public.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    kem_context = enc + pk_rm + pk_sm
+    return _hpke_extract_and_expand(dh, kem_context)
+
+
+def _coerce_relay_public_key(value: "RelayPublicKey | str | bytes") -> "RelayPublicKey":
+    if isinstance(value, RelayPublicKey):
+        return value
+    if isinstance(value, str):
+        return RelayPublicKey.from_base64(value)
+    if isinstance(value, (bytes, bytearray)):
+        return RelayPublicKey.from_raw(bytes(value))
+    raise InvalidPublicKeyError(
+        "relay public key must be a RelayPublicKey, base64 str, or X9.63 bytes"
+    )
+
+
+def _coerce_relay_private_key(value: "RelayPrivateKey | str | bytes") -> "RelayPrivateKey":
+    if isinstance(value, RelayPrivateKey):
+        return value
+    if isinstance(value, str):
+        return RelayPrivateKey.from_base64(value)
+    if isinstance(value, (bytes, bytearray)):
+        return RelayPrivateKey.from_raw(bytes(value))
+    raise InvalidPublicKeyError(
+        "relay private key must be a RelayPrivateKey, base64 str, or raw 32-byte scalar"
+    )
+
+
+def _coerce_hpke_field_bytes(value: "str | bytes", field: str) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        try:
+            return base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise InvalidCiphertextError(f"HPKE v3 {field} is not valid base64") from exc
+    raise InvalidCiphertextError(f"HPKE v3 {field} must be bytes or base64 str")
+
+
+def wrap_symmetric_key_v3(
+    key_data: bytes,
+    recipient_public_key: "RelayPublicKey | str | bytes",
+    aad: bytes,
+    *,
+    sender_private: "RelayPrivateKey | str | bytes",
+    _ephemeral_private=None,
+) -> RelayKeyWrapV3:
+    """RFC 9180 HPKE Auth-mode wrap of the 32-byte ``key_data`` (relay v3).
+
+    Suite ``DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256 + AES-256-GCM``, ``mode_auth``.
+    ``info = b"OpenBurnBar-HermesRelay-HPKE-v3|" + aad`` and the AEAD ``aad`` is
+    the same ``key_aad`` for the request. HPKE wraps only the content key.
+
+    Returns a :class:`RelayKeyWrapV3` carrying base64 ``enc`` (HPKE encapsulated
+    key, 65-byte X9.63 point) and ``wrapped_key`` (HPKE ciphertext+tag) plus the
+    v3 wire markers. ``sender_private`` is bound as the authenticated HPKE sender,
+    so the recipient's :func:`unwrap_symmetric_key_v3` opens it only against that
+    same pinned sender key. ``_ephemeral_private`` is for known-answer tests only.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if len(key_data) != _SYMMETRIC_KEY_BYTE_COUNT:
+        raise InvalidSymmetricKeyError("symmetric key must be 32 bytes")
+    recipient = _coerce_relay_public_key(recipient_public_key)
+    sender = _coerce_relay_private_key(sender_private)
+    shared_secret, enc = _hpke_auth_encap(
+        recipient._public_key(),
+        sender._private_key(),
+        ephemeral_private=_ephemeral_private,
+    )
+    cipher_key, base_nonce = _hpke_auth_key_schedule(shared_secret, _hpke_info(aad))
+    ciphertext = AESGCM(cipher_key).encrypt(base_nonce, key_data, aad)
+    return RelayKeyWrapV3(
+        enc=base64.b64encode(enc).decode("ascii"),
+        wrapped_key=base64.b64encode(ciphertext).decode("ascii"),
+    )
+
+
+def unwrap_symmetric_key_v3(
+    enc: "str | bytes",
+    wrapped_key: "str | bytes",
+    private_key: "RelayPrivateKey | str | bytes",
+    aad: bytes,
+    *,
+    pinned_sender_public: "RelayPublicKey | str | bytes",
+) -> bytes:
+    """RFC 9180 HPKE Auth-mode open of a v3 wrap -> the 32-byte content key.
+
+    Binds ``pinned_sender_public`` (the caller's PINNED peer key — NEVER a
+    wire-supplied ``senderPublicKey``) as the authenticated HPKE sender. A forged
+    ``enc`` / ``wrapped_key`` / ``aad``, a wrong recipient key, or a wrong pinned
+    sender key all change the derived key, so AES-256-GCM ``open`` raises
+    :class:`cryptography.exceptions.InvalidTag`. ``enc`` and ``wrapped_key`` may
+    be base64 strings (the wire form) or raw bytes.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    recipient = _coerce_relay_private_key(private_key)
+    sender = _coerce_relay_public_key(pinned_sender_public)
+    enc_bytes = _coerce_hpke_field_bytes(enc, "enc")
+    if len(enc_bytes) != _X963_PUBLIC_KEY_BYTE_COUNT:
+        raise InvalidCiphertextError(
+            "HPKE v3 enc must be a 65-byte X9.63 uncompressed point"
+        )
+    ciphertext = _coerce_hpke_field_bytes(wrapped_key, "wrappedKey")
+    shared_secret = _hpke_auth_decap(
+        enc_bytes, recipient._private_key(), sender._public_key()
+    )
+    cipher_key, base_nonce = _hpke_auth_key_schedule(shared_secret, _hpke_info(aad))
+    return AESGCM(cipher_key).decrypt(base_nonce, ciphertext, aad)
