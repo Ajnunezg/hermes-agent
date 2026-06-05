@@ -1,14 +1,16 @@
-"""Byte-exact Python mirror of the canonical ``HermesRelayCrypto`` (Swift).
+"""Self-contained Python implementation of the BurnBar relay E2E key wrap.
 
 The relay end-to-end-encryption scheme used by the BurnBar Hermes Gateway seals
 every private payload to the peer's P-256 public key so the relay server only
-ever store-and-forwards ciphertext. The single source of truth is the Swift
-implementation at
-``OpenBurnBarCore/Sources/OpenBurnBarCore/SharedModels/HermesRelayCrypto.swift``;
-the Android Kotlin port and this Python port are byte-for-byte
-wire-compatible with it. The shared interop gate is the wire vector at
-``OpenBurnBarCoreTests/Fixtures/HermesRelayWireVector.json`` (vendored into
-``tests/gateway/fixtures/``), which all three implementations open.
+ever store-and-forwards ciphertext. The wire format (AAD labels, X9.63 key
+encoding, the v2 authenticated 2-DH key wrap) is shared with the BurnBar iOS
+(CryptoKit) and Android clients; this module is the reference Python side of
+that contract. Its known-answer vector lives at
+``tests/gateway/fixtures/HermesRelayWireVector.json`` and is regenerated and
+byte-verified in-tree by ``tests/gateway/vectors/generate_wire_vectors.py``
+(see ``tests/gateway/test_wire_vectors_reproducible.py``). Cross-language parity
+with the mobile clients is maintained in those client repositories; it is not
+re-proven here.
 
 Wire invariants (do not drift — pinned in ``tests/gateway/test_relay_e2ee.py``)
 
@@ -112,6 +114,11 @@ _NONCE_BYTE_COUNT = 12
 _TAG_BYTE_COUNT = 16
 _X963_PUBLIC_KEY_BYTE_COUNT = 65
 _P256_COORDINATE_BYTE_COUNT = 32
+# Order of the NIST P-256 / secp256r1 prime-order group. A valid private scalar
+# is in [1, n-1]; 0 and any value >= n are rejected at construction so a corrupt
+# stored key surfaces a typed RelayCryptoError instead of a raw library
+# ValueError deep inside an ECDH call.
+_P256_GROUP_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 _HKDF_SALT = b"\x00" * 32  # RFC 5869 empty-salt -> HashLen zero bytes; matches Swift salt: Data()
 
 
@@ -306,6 +313,14 @@ class RelayPrivateKey:
         if len(self.raw_representation) != _P256_COORDINATE_BYTE_COUNT:
             raise InvalidPublicKeyError(
                 "relay private key must be the raw 32-byte P-256 scalar"
+            )
+        # Range-check the scalar so a zero/overflowing key fails closed here with a
+        # typed error rather than as a bare ValueError later inside
+        # ``ec.derive_private_key`` (which every wrap/unwrap/public-key path hits).
+        scalar = int.from_bytes(self.raw_representation, "big")
+        if not 1 <= scalar < _P256_GROUP_ORDER:
+            raise InvalidPublicKeyError(
+                "relay private key scalar is out of range [1, n-1] for P-256"
             )
 
     @classmethod

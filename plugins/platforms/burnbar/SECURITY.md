@@ -57,18 +57,18 @@ byte-stable.
 
 ## Vector Coverage
 
-`tests/gateway/fixtures/HermesGatewayWireVector.json` proves Swift-to-Python
-byte compatibility for v2 key wrapping and payload opening, including wrong
-sender rejection. It is a crypto wire vector, not a complete current adapter
-schema vector.
+`tests/gateway/fixtures/HermesGatewayWireVector.json` is a known-answer vector for
+the v2 key wrap and payload opening (event, agent reply, model_switch, and
+attachment slots), including wrong-sender and wrong-recipient rejection. Its event
+and `model_switch` plaintexts already carry the strict E2E schema (authenticated
+`destinationId` + `replayCounter`), and
+`test_gateway_event_vector_passes_production_open_path` runs that slot through the
+full production `_handle_burnbar_event` path — not merely the bare crypto open.
 
-Before merge with a BurnBar client release that emits the strict E2E event
-schema, refresh or add a Swift-emitted gateway vector whose event and
-`model_switch` plaintext include:
-
-- `destinationId`
-- `replayCounter` or `eventCounter`
-- the current control payload shape for approvals/model switches
-
-The Python adapter tests enforce that current schema locally; the refreshed
-Swift vector should prove cross-language byte compatibility for the same schema.
+Both this and the v1 realtime vector (`HermesRelayWireVector.json`) are regenerated
+and byte-verified in-tree by `tests/gateway/vectors/generate_wire_vectors.py`
+(`python -m tests.gateway.vectors.generate_wire_vectors --check`, also enforced by
+`tests/gateway/test_wire_vectors_reproducible.py`), so a maintainer can re-derive
+every ciphertext byte from this repo alone with no non-Python toolchain. The same
+wire format is implemented by the BurnBar iOS/Android clients; cross-language parity
+is maintained in those client repositories and is not re-proven here.

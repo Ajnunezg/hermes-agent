@@ -33,7 +33,10 @@ try:
     from gateway.crypto import relay_e2ee
 
     RELAY_CRYPTO_AVAILABLE = True
-except Exception:  # pragma: no cover - cryptography missing in CI slice.
+except ImportError:  # pragma: no cover - cryptography missing in CI slice.
+    # Narrow to ImportError (matching adapter.py MP-25): a broad `except Exception`
+    # would mask a real crypto fault (FIPS rejection, missing system lib) as
+    # "crypto unavailable" and silently skip the entire E2E test surface green.
     relay_e2ee = None
     RELAY_CRYPTO_AVAILABLE = False
 
@@ -1991,13 +1994,13 @@ async def test_mp5_e2e_capable_agent_refuses_inbound_plaintext_without_optin(mon
 
 @requires_relay
 @pytest.mark.asyncio
-async def test_swift_gateway_event_vector_passes_production_open_path(monkeypatch, tmp_path):
-    """#5 closure: the Swift-emitted gateway EVENT vector — now carrying the strict
+async def test_gateway_event_vector_passes_production_open_path(monkeypatch, tmp_path):
+    """#5 closure: the committed gateway EVENT vector — now carrying the strict
     schema (authenticated destinationId + replayCounter) — is ACCEPTED by the FULL
     production ``_handle_burnbar_event`` path, not merely the direct crypto open.
 
-    Before the schema refresh the same Swift vector was dropped at the destinationId /
-    replayCounter gate, so this is the regression guard proving the cross-language
+    Before the schema refresh the same vector was dropped at the destinationId /
+    replayCounter gate, so this is the regression guard proving the committed
     fixture matches the ENFORCED event schema (not just the crypto envelope).
     """
     fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "HermesGatewayWireVector.json")
@@ -2047,6 +2050,16 @@ async def test_swift_gateway_event_vector_passes_production_open_path(monkeypatc
     assert received[0].text == "open the BurnBar gateway"
     # The authenticated replayCounter (1) advanced the persisted high-water mark.
     assert adapter._event_replay_high_water == 1
+    # Hardening: an E2E-authenticated event must NOT carry the relay ciphertext
+    # envelope downstream into the trajectory — only routing-relevant fields. This
+    # guards the raw_message sanitization (the relay already holds these blobs;
+    # they must not bloat session logs / exports).
+    raw = received[0].raw_message
+    assert isinstance(raw, dict)
+    assert raw.get("id") == event["eventId"]
+    assert raw.get("destinationId") == "burnbar:home"
+    for leaked in ("payloadCiphertext", "wrappedKey", "relayEnvelope", "senderPublicKey"):
+        assert leaked not in raw, f"sealed event raw_message leaked {leaked}"
 
 
 @requires_relay
