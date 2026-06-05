@@ -473,8 +473,12 @@ def _coerce_peer_relay_key_version(value: Any) -> int:
     counter = _coerce_replay_counter(value)
     if counter == GATEWAY_RELAY_KEY_VERSION:
         return counter
-    if counter == GATEWAY_RELAY_KEY_VERSION_V4 and _gateway_hpke_v4_enabled():
-        return counter
+    if counter == GATEWAY_RELAY_KEY_VERSION_V4:
+        if _gateway_hpke_v4_enabled():
+            return counter
+        # Break-glass (v4 disabled): degrade a v4-pinned peer to v3 — the next-best
+        # AUTHENTICATED wrap — not all the way down to the v2 floor.
+        return GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
     if counter == GATEWAY_RELAY_KEY_VERSION_V3 and _gateway_hpke_v3_enabled():
         return counter
     return GATEWAY_RELAY_KEY_VERSION
@@ -1513,6 +1517,18 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._peer_signing_key: Optional[str] = (
             os.getenv(RELAY_PEER_SIGNING_KEY_ENV) or ""
         ).strip() or None
+        # Validate an env/runtime-set peer signing key at startup; an invalid value
+        # is treated as ABSENT (the link floors to v3) rather than failing every v4
+        # send, matching the pairing-path behaviour.
+        if self._peer_signing_key and RELAY_CRYPTO_AVAILABLE:
+            try:
+                relay_e2ee_v4.RelayVerifyKey.from_base64(self._peer_signing_key)
+            except Exception:
+                logger.warning(
+                    "[%s] %s is invalid; flooring this link to v3",
+                    self.name, RELAY_PEER_SIGNING_KEY_ENV,
+                )
+                self._peer_signing_key = None
         self._peer_signing_keys: Dict[str, str] = {}
         # Monotonic rotation epoch of the pinned peer encryption key. An authenticated
         # key_rotation event must advance it by exactly 1; the replay high-water is
@@ -2230,6 +2246,7 @@ class BurnBarAdapter(BasePlatformAdapter):
         authed: Optional[dict] = None
         replay_counter: Optional[int] = None
         model_switch_applied = False
+        is_ratchet = False
         destination_id = str(raw.get("destinationId") or self._home_channel)
         try:
             authed = self._sealer.open_event(raw)
@@ -2323,8 +2340,13 @@ class BurnBarAdapter(BasePlatformAdapter):
             return
         # MP-3: record the authenticated id ONLY now — after a successful open and
         # before dispatch — so only events that actually authenticated consume a
-        # cache slot.
-        if not self._record_event(event_id, replay_counter=replay_counter):
+        # cache slot. The signed/legacy lanes rely on this id ledger as their replay
+        # anchor, so a failed record drops the event. The ratchet lane's single-use
+        # message key (already consumed + durably persisted in _open_ratchet) is the
+        # AUTHORITATIVE replay defense, so a transient ledger-persist failure must
+        # NOT lose a message whose ratchet step is already durable — deliver it
+        # (a duplicate frame would fail the ratchet AEAD regardless of the id cache).
+        if not self._record_event(event_id, replay_counter=replay_counter) and not is_ratchet:
             return
         # MP-8: on an E2E-authenticated event, sender identity MUST come from the
         # sealed payload, never from relay-controlled top-level metadata (which a
