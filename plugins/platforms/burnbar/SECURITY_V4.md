@@ -12,7 +12,7 @@ byte-for-byte (cross-language parity is maintained in those repositories).
 | Residual risk (v3) | v4 remediation | Standard / anchor |
 |---|---|---|
 | **KCI / implicit-only auth** — a leaked *recipient* static key lets a holder forge any sender | **Explicit Ed25519 sender signature**, encrypt-then-sign, verified against the *pinned* key | RFC 8032; RFC 9180 §9.1.1 (its own recommendation) |
-| **No forward secrecy / no PCS** for the static leg | Not claimed in the current adapter. The ratchet primitive exists, but the production lane is disabled until a v4-signed `ratchet_init` authenticates the first ratchet key. | Signal Double Ratchet (Perrin & Marlinspike), pending signed init |
+| **No forward secrecy / no PCS** for the static leg | The signed chat lane requires a v4-signed `ratchet_init` before accepting ratchet frames; after the first phone ratchet message, chat uses Double Ratchet FS/PCS. Controls and pre-init chat stay on the v4 signed lane. | Signal Double Ratchet (Perrin & Marlinspike), v4 signed init |
 | **Size metadata** (relay sees ciphertext length) | **Padmé** length padding (≤ ~12% overhead) | Nikitin et al., PoPETs 2019 |
 | **Pairing MITM** anchored on a code that bound only the static key | **All-key safety code** for currently shipped keys (encryption + signing) | Signal safety numbers (SAS) |
 | **No rotation / key-ids** (rotation = full re-pair) | **Sign-the-successor rotation event** + 128-bit key-id selectors | X3DH signed-prekey rotation; key-continuity |
@@ -44,20 +44,24 @@ valid signed frame). The v4 signed seal path applies Padmé (below) to the paylo
 *inside* the AEAD, so the relay sees only a length-hidden ciphertext. Anchored to
 the RFC 8032 §7.1 known-answer vectors in `test_relay_e2ee_v4.py`.
 
-### 2. Ratchet primitive status — `hermes_ratchet.py`
+### 2. Signed ratchet init + chat lane — `hermes_ratchet.py` + adapter
 
 `hermes_ratchet.py` implements a Signal-style Double Ratchet over P-256 /
 HKDF-SHA256 / AES-256-GCM, with bounded skipped-message keys and transactional
-decrypt. Those primitive tests remain valuable, but the adapter does **not** route
-production chat through ratchet today.
+decrypt.
 
 The old deterministic static-static bootstrap is disabled because a holder of the
 recipient static private key could derive the same initial session and forge the
 initiator. The only acceptable production bootstrap is a v4-signed `ratchet_init`
-control message that binds the first ratchet public key, session id, device ids,
-destination id, and epoch to the Ed25519-pinned pairing identity. Until that
-handshake ships on every client, the adapter refuses `ratchetEnvelope` frames and
-uses the v4 signed lane for chat.
+control message that binds the first ratchet public keys, a 32-byte nonzero root
+key, session id, device ids, destination id, `uid`, `clientId`, algorithm, and
+replay counter to the Ed25519-pinned pairing identity. The adapter advertises a
+durable `agentRatchetInitPublicKey` by default; `BURNBAR_DISABLE_GATEWAY_RATCHET=1`
+is the explicit break-glass disable. It refuses every `ratchetEnvelope` until the
+signed init has established a destination session.
+The responder (agent) has no sending chain until it receives the first phone
+ratchet message, so pre-init and pre-first-message replies fall back to the v4
+signed lane. After that first receive, normal chat replies use the ratchet lane.
 
 ### 3. Size-metadata minimization — Padmé
 
@@ -74,8 +78,8 @@ pinned keys — `(tag, key)` entries length-prefixed and sorted, under a domain-
 separated label, the two party blobs sorted (role-free), SHA-256, 128-bit. Adding
 a key class changes the code, so a relay can never substitute a new signing key
 while the human-compared code still matches. (The current two-key code already
-binds the static key; v4 extends it to the signing key. A future ratchet init must
-bind its first ratchet key in the signed init transcript.)
+binds the static key; v4 extends it to the signing key. The ratchet init binds
+its first ratchet keys inside the signed init transcript.)
 
 ### 5. Authenticated rotation + key-ids
 
@@ -93,9 +97,9 @@ so a swap does not reopen the old-frame replay window.
 - **Signing-key compromise** still forges senders **on the v4 signed lane** — but
   this moves the trust to a key that *no longer also decrypts* (a `skR` leak alone
   no longer forges), and the signed rotation path lets a compromised key be
-  retired. Store keys in the OS keychain / Secure Enclave. Do not claim FS/PCS or
-  signing-key-compromise immunity until the signed ratchet init is implemented and
-  enabled end-to-end.
+  retired. Store keys in the OS keychain / Secure Enclave. Ratchet FS/PCS applies
+  only after a v4-signed init and ratchet traffic; it does not make a compromised
+  v4 signing key harmless for future signed-control events.
 - **No post-quantum protection** — a harvest-now-decrypt-later adversary can break
   P-256 / the ratchet DH with a future quantum computer. Closing this is a future
   wire version (v5), not an additive patch, and is **deliberately deferred** after
@@ -107,10 +111,9 @@ so a swap does not reopen the old-frame replay window.
   ML-KEM-768, e.g. RFC 9180 hybrid-KEM / X-Wing) as `relayKeyVersion = 5`, layered
   the same additive way v4 was. The Double Ratchet already bounds the per-message
   blast radius in the meantime.
-- **No production FS/PCS today** — the v4 signed lane is strong sender-authenticated
-  E2EE, but it is still a static-key transport. Forward secrecy and
-  post-compromise healing require the disabled ratchet lane to return with signed
-  init.
+- **FS/PCS is chat-lane only after init** — the v4 signed lane is still the
+  authoritative control/pre-init transport. Forward secrecy and post-compromise
+  healing begin only for messages exchanged inside an established ratchet session.
 - **Timing, frequency, and message ordering** remain visible to a store-and-forward
   relay and are **not** addressable without a mixnet / cover-traffic regime the
   threat model excludes. Padmé hides size, not timing. Sealed-sender + rotating
@@ -136,11 +139,12 @@ The Python adapter wires all five controls through the real send/open/pairing pa
   marker / `enc` / `senderSig` / pinned signing key.
 - **Pairing safety code.** Binds all pinned keys (encryption + signing) via
   `_relay_safety_code_v4` so a substituted signing key changes the human code.
-- **Ratchet chat lane.** Disabled in the adapter. `BURNBAR_RELAY_RATCHET=1` is a
-  reserved compatibility flag; it does not enable ratchet send or receive. The
-  receive path refuses `ratchetEnvelope` frames until the first ratchet public key
-  is authenticated by a v4-signed `ratchet_init` handshake and the client parity
-  tests cover Python, Swift, and Kotlin.
+- **Ratchet chat lane.** A durable `agentRatchetInitPublicKey` is advertised by
+  default unless `BURNBAR_DISABLE_GATEWAY_RATCHET=1` is set. The receive path
+  refuses `ratchetEnvelope` frames until a v4-signed `ratchet_init` authenticates
+  the phone ratchet key, agent ratchet key, root key, session id, device ids,
+  routing ids, algorithm, destination, and replay counter. Controls are still
+  refused on ratchet; they must use the v4 signed lane.
 - **Anti-downgrade floor.** On a link the grant pinned to v4, a v2/v3-labeled
   inbound frame is refused explicitly before unwrap (a relay cannot strip the
   Ed25519 layer by relabeling); break-glass floors the pinned version so a
@@ -152,7 +156,10 @@ The Python adapter wires all five controls through the real send/open/pairing pa
 
 New env keys: `BURNBAR_RELAY_SIGNING_KEY` (agent signing seed),
 `BURNBAR_RELAY_PEER_SIGNING_KEY` (pinned peer signing key),
-`BURNBAR_RELAY_PEER_KEY_EPOCH` (rotation epoch), `BURNBAR_RELAY_RATCHET` (reserved;
-current adapter refuses ratchet), `BURNBAR_DISABLE_GATEWAY_HPKE_V4` (break-glass).
-The matching Swift/Kotlin client implementations follow this same reference wire
-contract for the signed v4 lane.
+`BURNBAR_RELAY_PEER_KEY_EPOCH` (rotation epoch),
+`BURNBAR_DISABLE_GATEWAY_RATCHET` (break-glass disable for signed-init ratchet
+chat), `BURNBAR_DISABLE_GATEWAY_HPKE_V4` (break-glass). The legacy
+`BURNBAR_RELAY_RATCHET` opt-in flag is accepted as a no-op for older launch
+scripts. The
+matching clients must follow the same reference wire contract; Python parity is
+locked by `tests/gateway/fixtures/hermes_ratchet_init_v1.json`.

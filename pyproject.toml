@@ -124,16 +124,12 @@ wecom = ["defusedxml==0.7.1"]
 # Gateway end-to-end relay encryption (gateway/crypto/relay_e2ee.py). Seals
 # gateway relay payloads to the peer's P-256 public key so the relay
 # server only store-and-forwards ciphertext. `cryptography` is already in
-# uv.lock transitively (alibabacloud/azure deps pin 46.0.7); this extra makes
+# uv.lock transitively; this extra makes
 # the dependency explicit and lazy-loadable for installs that enable the
-# BurnBar gateway. Bounded range `>=46.0.7,<47` — a floor (the version already in
-# uv.lock) so the leg tracks 46.x security patches, plus an upper bound at the next
-# major so an unreviewed `cryptography` 47.x cannot be auto-pulled. The relay byte
-# format only depends on the stable AES-256-GCM / P-256 / HKDF-SHA256 primitives,
-# which are ABI-stable within a major. The core `dependencies` exact-pin policy
-# (top of file) does not extend to opt-in extras, but the supply-chain rationale
-# behind it does, hence the capped upper bound rather than an open `>=`.
-gateway-e2ee = ["cryptography>=46.0.7,<47"]
+# BurnBar gateway. v5 requires pyca's HPKE MLKEM768_X25519 and ML-KEM APIs, so
+# clean installs must resolve a 48.x wheel; the upper bound keeps supply-chain
+# drift reviewable.
+gateway-e2ee = ["cryptography>=48,<49"]
 cli = ["simple-term-menu==1.6.6"]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [

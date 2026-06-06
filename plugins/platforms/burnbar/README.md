@@ -23,7 +23,7 @@ message the agent — and supervise it — from the BurnBar iOS/macOS apps.
   AES-256-GCM). The agent emits v3 only to a peer the authenticated pairing grant
   marked v3-capable and floors an unknown/v2-only peer to v2; the open path
   dispatches on each envelope's own `relayKeyVersion` and refuses anything outside
-  the supported `{2, 3}` set (so v1 and plaintext stay unreachable on a paired
+  the supported `{2, 3, 4, 5}` set (so v1 and plaintext stay unreachable on a paired
   link). v3 wraps only the content key — the payload/attachment AES-256-GCM layers
   are byte-unchanged. `BURNBAR_DISABLE_GATEWAY_HPKE_V3=1` is a break-glass rollback
   to v2-only emission.
@@ -31,11 +31,18 @@ message the agent — and supervise it — from the BurnBar iOS/macOS apps.
   signature** over the v3 HPKE envelope (KCI resistance: a leaked recipient key can
   no longer forge a sender) and **Padmé** length padding. Negotiated only when the
   authenticated pairing grant pins the peer's signing key; the safety code then
-  binds the encryption **and** signing keys. The experimental Double Ratchet chat
-  lane is disabled until its first public key is authenticated inside a v4-signed
-  `ratchet_init` handshake. `key_rotation` is an authenticated successor-key event.
+  binds the encryption **and** signing keys. The Double Ratchet chat lane is
+  available only after a v4-signed `ratchet_init` authenticates the first ratchet
+  keys and root key; controls stay on the v4 signed lane. `key_rotation` is an
+  authenticated successor-key event.
   See [`SECURITY_V4.md`](SECURITY_V4.md) for the full design, threat-model closure,
   and honest residuals.
+- **Post-quantum wrap (v5)** — `relayKeyVersion = 5` adds a signed hybrid
+  ML-KEM-768/X25519 HPKE content-key wrap. The all-key safety code binds the PQ
+  KEM public key. Ratchet init v2 derives the initial root from the signed KEM
+  transcript plus a root-confirm MAC; `rootKeyBase64` is forbidden for v2. See
+  [`SECURITY_V5.md`](SECURITY_V5.md) and
+  [`RELAY_E2EE_V5_SPEC.md`](../../../docs/gateway/RELAY_E2EE_V5_SPEC.md).
 - **Safety-code comparison** after setup: when E2E is enabled, the CLI prints the
   same short code BurnBar shows in the Private messages sheet. The prompt defaults
   to **no** and only accepts valid X9.63 P-256 public keys. Matching codes prove
@@ -91,12 +98,24 @@ Optional:
 
 v4 hardening (managed by `hermes gateway setup`; rarely set by hand):
 
-- `BURNBAR_RELAY_RATCHET=1` — reserved for a future Double Ratchet chat lane.
-  Current builds refuse ratchet frames and continue using the v4 signed lane.
+- Signed-init Double Ratchet is enabled by default. The adapter advertises
+  `agentRatchetInitPublicKey`, refuses ratchet frames before a signed
+  `ratchet_init`, and uses signed envelopes for controls/pre-init.
+- `BURNBAR_DISABLE_GATEWAY_RATCHET=1` — break-glass: stop advertising and using
+  the signed ratchet lane. `BURNBAR_RELAY_RATCHET=1` is accepted as a legacy
+  no-op for old launch scripts.
 - `BURNBAR_DISABLE_GATEWAY_HPKE_V4=1` — break-glass: emit v2/v3 only.
 - `BURNBAR_RELAY_SIGNING_KEY` / `BURNBAR_RELAY_PEER_SIGNING_KEY` — the agent's
   Ed25519 signing seed and the pinned peer signing key (set at pairing).
 - `BURNBAR_RELAY_PEER_KEY_EPOCH` — the pinned peer key's rotation epoch.
+
+v5 hardening:
+
+- `BURNBAR_RELAY_KEM_PRIVATE_KEY` / `BURNBAR_RELAY_PEER_KEM_PUBLIC_KEY` — the
+  agent's hybrid KEM seed and the pairing-pinned peer KEM public key.
+- `BURNBAR_DISABLE_GATEWAY_HPKE_V5=1` — explicit break-glass: lower a v5-pinned
+  link to v4. Without this flag, a v5-pinned install missing `cryptography>=48`
+  or the local KEM seed fails closed.
 
 ## Setup
 
@@ -135,8 +154,9 @@ static private key is stolen, past messages wrapped to that key can be decrypted
 and an attacker can forge as any sender; the static leg has no post-compromise
 forward secrecy. **v4 closes KCI for the production signed lane:** the Ed25519
 explicit signature makes a leaked recipient key unable to forge a sender. Forward
-secrecy and post-compromise security are not claimed until the disabled ratchet
-lane is reintroduced with a v4-signed `ratchet_init` handshake. Remaining residuals
+secrecy and post-compromise security apply only after an authenticated
+`ratchet_init` establishes the chat ratchet; controls and pre-init chat are still
+the v4 signed lane. Remaining residuals
 (signing-key compromise, no post-quantum, timing/ordering metadata, TOFU pairing)
 are documented honestly in [`SECURITY_V4.md`](SECURITY_V4.md). Replay rejection is
 enforced by the adapter's persisted id ledger plus the sealed replay-counter
@@ -153,8 +173,8 @@ From the Hermes repo root:
 # Plugin registration, event mapping, send/typing/attachments, oversight,
 # runtime status + model switch, the relay seal -> open round-trip, the v2/v3
 # key-wrap known-answer vectors (incl. the RFC 9180 Appendix-A HPKE Auth vector),
-# and the v4 hardening (RFC 8032 Ed25519 KAT, Padmé, disabled-ratchet receive
-# refusal, rotation) wired end-to-end through the adapter.
+# and the v4 hardening (RFC 8032 Ed25519 KAT, Padmé, signed ratchet-init parity,
+# ratchet receive path, rotation) wired end-to-end through the adapter.
 scripts/run_tests.sh \
   tests/gateway/test_burnbar_plugin.py tests/gateway/test_burnbar_plugin_v3.py \
   tests/gateway/test_burnbar_plugin_v4.py tests/gateway/test_relay_e2ee.py \
