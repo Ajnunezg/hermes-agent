@@ -9,7 +9,9 @@ floors to v3. The crypto-layer proofs live in ``test_relay_e2ee_v4.py``.
 
 from __future__ import annotations
 
+import base64
 import json
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,7 @@ requires_relay = pytest.mark.skipif(
 
 _UID = "uid-v4"
 _CLIENT = "client-v4"
+_FIXTURES = Path(__file__).with_name("fixtures")
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +147,36 @@ def test_seal_message_emits_v4_and_peer_opens(monkeypatch):
 
 
 @requires_relay
+def test_ratchet_init_v1_parity_vector():
+    vector = json.loads((_FIXTURES / "hermes_ratchet_init_v1.json").read_text(encoding="utf-8"))
+    agent_pair = hr.HermesRatchetKeyPair.from_wire(vector["agentRatchetInitKeyPair"])
+    phone_pair = hr.HermesRatchetKeyPair.from_wire(vector["phoneRatchetInitKeyPair"])
+    hr.validate_key_pair(agent_pair)
+    hr.validate_key_pair(phone_pair)
+    payload = {
+        "kind": _burnbar.RATCHET_INIT_KIND,
+        "ratchetInitVersion": _burnbar.RATCHET_INIT_VERSION,
+        "algorithm": hr.ALGORITHM,
+        "uid": vector["uid"],
+        "clientId": vector["clientId"],
+        "destinationId": vector["destinationId"],
+        "sessionID": hr.derive_session_id(
+            uid=vector["uid"],
+            client_id=vector["clientId"],
+            agent_ratchet_public_key_base64=agent_pair.public_key_base64,
+            peer_ratchet_public_key_base64=phone_pair.public_key_base64,
+        ),
+        "initiatorRatchetPublicKeyBase64": phone_pair.public_key_base64,
+        "responderRatchetPublicKeyBase64": agent_pair.public_key_base64,
+        "initiatorDeviceID": hr.derive_device_id(phone_pair.public_key_base64),
+        "responderDeviceID": hr.derive_device_id(agent_pair.public_key_base64),
+        "rootKeyBase64": vector["rootKeyBase64"],
+        "replayCounter": 1,
+    }
+    assert payload == vector["expectedPayload"]
+
+
+@requires_relay
 def test_open_event_opens_v4_frame(monkeypatch):
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, **k)
@@ -248,7 +281,7 @@ def test_invalid_env_peer_signing_key_floors_to_v3(monkeypatch):
 @requires_relay
 @pytest.mark.asyncio
 async def test_ratchet_frame_refused_even_if_replay_ledger_record_fails(monkeypatch):
-    """Ratchet is disabled until a signed init exists, so ledger behavior cannot
+    """Ratchet is refused until a signed init exists, so ledger behavior cannot
     turn a ratchet frame into a delivered plaintext event."""
     monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
     k = _keys()
@@ -285,6 +318,43 @@ def _phone_initiator(k):
         role=hr.HermesRatchetRole.INITIATOR, uid=_UID, client_id=_CLIENT,
         local_ratchet_key_pair=pair, peer_ratchet_public_key_base64=k["agent_enc"].public_key_base64(),
     )
+
+
+def _signed_ratchet_init(adapter, k, *, event_id="ratchet-init-1", replay_counter=1, phone_pair=None, root_key=None):
+    agent_pair = adapter._ensure_ratchet_init_key_pair()
+    assert agent_pair is not None
+    phone_pair = phone_pair or hr.generate_key_pair()
+    root_key = root_key or hr.random_root_key()
+    session_id = hr.derive_session_id(
+        uid=_UID,
+        client_id=_CLIENT,
+        agent_ratchet_public_key_base64=agent_pair.public_key_base64,
+        peer_ratchet_public_key_base64=phone_pair.public_key_base64,
+    )
+    payload = {
+        "kind": _burnbar.RATCHET_INIT_KIND,
+        "ratchetInitVersion": _burnbar.RATCHET_INIT_VERSION,
+        "algorithm": hr.ALGORITHM,
+        "uid": _UID,
+        "clientId": _CLIENT,
+        "destinationId": "burnbar:home",
+        "sessionID": session_id,
+        "initiatorRatchetPublicKeyBase64": phone_pair.public_key_base64,
+        "responderRatchetPublicKeyBase64": agent_pair.public_key_base64,
+        "initiatorDeviceID": hr.derive_device_id(phone_pair.public_key_base64),
+        "responderDeviceID": hr.derive_device_id(agent_pair.public_key_base64),
+        "rootKeyBase64": base64.b64encode(root_key).decode("ascii"),
+        "replayCounter": replay_counter,
+    }
+    phone = hr.initiator_state(
+        session_id=session_id,
+        local_device_id=payload["initiatorDeviceID"],
+        remote_device_id=payload["responderDeviceID"],
+        shared_secret=root_key,
+        remote_initial_ratchet_public_key_base64=agent_pair.public_key_base64,
+        local_initial_ratchet_key_pair=phone_pair,
+    )
+    return _phone_to_agent_v4_event(event_id=event_id, payload=payload, **k), phone, payload
 
 
 def _phone_ratchet_frame(phone, payload, event_id):
@@ -347,11 +417,11 @@ async def test_recipient_static_kci_cannot_forge_ratchet_through_handler(monkeyp
     assert received == []
 
 
-# --- FULL-PATTH receive tests: drive the production _handle_burnbar_event ----
+# --- FULL-PATH receive tests: drive the production _handle_burnbar_event ----
 @requires_relay
 @pytest.mark.asyncio
-async def test_ratchet_chat_refused_through_full_handler(monkeypatch):
-    """Ratchet frames are refused through the real handler until signed init ships."""
+async def test_v4_signed_ratchet_init_enables_chat_through_full_handler(monkeypatch):
+    """A v4-signed ratchet_init through the real handler enables ratchet chat."""
     monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, **k)
@@ -361,17 +431,25 @@ async def test_ratchet_chat_refused_through_full_handler(monkeypatch):
         received.append(event)
 
     adapter.handle_message = capture
-    phone = _phone_initiator(k)
+    init_raw, phone, _payload = _signed_ratchet_init(adapter, k)
+    await adapter._handle_burnbar_event(init_raw)
+    assert received == []
+    assert adapter._can_ratchet("burnbar:home")
     await adapter._handle_burnbar_event(
         _phone_ratchet_frame(phone, {"text": "hi over ratchet", "destinationId": "burnbar:home"}, "rm1")
     )
-    assert received == []
+    assert received and received[0].text == "hi over ratchet"
+
+    reply = adapter._sealer.seal_message(destination_id="burnbar:home", text="ratchet reply")
+    assert "ratchetEnvelope" in reply and "payloadCiphertext" not in reply
+    opened = hr.decrypt(hr.HermesRatchetEnvelope.from_wire(reply["ratchetEnvelope"]), phone)
+    assert json.loads(v4.padme_unpad(opened)) == {"text": "ratchet reply", "destinationId": "burnbar:home"}
 
 
 @requires_relay
 @pytest.mark.asyncio
-async def test_ratchet_out_of_order_refused_through_handler(monkeypatch):
-    """Out-of-order ratchet frames are still refused while the lane is disabled."""
+async def test_ratchet_out_of_order_delivered_through_handler(monkeypatch):
+    """Out-of-order ratchet frames decrypt through the signed-init session."""
     monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, **k)
@@ -381,12 +459,13 @@ async def test_ratchet_out_of_order_refused_through_handler(monkeypatch):
         received.append(event)
 
     adapter.handle_message = capture
-    phone = _phone_initiator(k)
+    init_raw, phone, _payload = _signed_ratchet_init(adapter, k)
+    await adapter._handle_burnbar_event(init_raw)
     f0 = _phone_ratchet_frame(phone, {"text": "m0", "destinationId": "burnbar:home"}, "rm0")
     f1 = _phone_ratchet_frame(phone, {"text": "m1", "destinationId": "burnbar:home"}, "rm1")
     await adapter._handle_burnbar_event(f1)  # deliver the LATER one first
     await adapter._handle_burnbar_event(f0)  # then the earlier one (skipped key)
-    assert received == []
+    assert [event.text for event in received] == ["m1", "m0"]
 
 
 @requires_relay
@@ -403,7 +482,8 @@ async def test_control_kind_refused_on_ratchet_lane(monkeypatch):
         received.append(event)
 
     adapter.handle_message = capture
-    phone = _phone_initiator(k)
+    init_raw, phone, _payload = _signed_ratchet_init(adapter, k)
+    await adapter._handle_burnbar_event(init_raw)
     await adapter._handle_burnbar_event(
         _phone_ratchet_frame(
             phone, {"kind": "model_switch", "modelId": "evil/model", "destinationId": "burnbar:home"}, "rm-ctl"
@@ -415,7 +495,7 @@ async def test_control_kind_refused_on_ratchet_lane(monkeypatch):
 @requires_relay
 @pytest.mark.asyncio
 async def test_ratchet_refuses_rebootstrap_after_session_loss(monkeypatch):
-    """Deterministic rebootstrap is unreachable while the ratchet lane is disabled."""
+    """Session-cache loss does not trigger deterministic rebootstrap."""
     monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
     k = _keys()
     adapter = _paired_v4_adapter(monkeypatch, **k)
@@ -425,11 +505,12 @@ async def test_ratchet_refuses_rebootstrap_after_session_loss(monkeypatch):
         received.append(event)
 
     adapter.handle_message = capture
-    phone = _phone_initiator(k)
+    init_raw, phone, _payload = _signed_ratchet_init(adapter, k)
+    await adapter._handle_burnbar_event(init_raw)
     await adapter._handle_burnbar_event(
         _phone_ratchet_frame(phone, {"text": "first", "destinationId": "burnbar:home"}, "r-a")
     )
-    assert received == []
+    assert [event.text for event in received] == ["first"]
     adapter._ratchet_sessions.clear()
     adapter._ratchet_sessions_loaded = False
     if _burnbar.RATCHET_SESSION_FILE.exists():
@@ -437,7 +518,7 @@ async def test_ratchet_refuses_rebootstrap_after_session_loss(monkeypatch):
     await adapter._handle_burnbar_event(
         _phone_ratchet_frame(phone, {"text": "replayed-or-new", "destinationId": "burnbar:home"}, "r-b")
     )
-    assert received == []
+    assert [event.text for event in received] == ["first"]
 
 
 @requires_relay
@@ -515,6 +596,140 @@ def test_ratchet_env_uses_v4_signed_until_signed_init(monkeypatch, tmp_path):
         "destinationId": "burnbar:home",
         "replayCounter": 1,
     }
+
+
+@requires_relay
+def test_corrupt_ratchet_state_refuses_silent_init_key_rotation(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    _burnbar.RATCHET_SESSION_FILE.write_text("{not-json", encoding="utf-8")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+
+    assert adapter._ratchet_init_public_key_for_advertisement() is None
+    assert not _burnbar.RATCHET_SESSION_FILE.read_text(encoding="utf-8").startswith('{"_schemaVersion"')
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_signed_ratchet_init_with_zero_root_key_is_refused(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    raw, phone, _payload = _signed_ratchet_init(adapter, k, root_key=b"\x00" * 32)
+    await adapter._handle_burnbar_event(raw)
+    assert not adapter._can_ratchet("burnbar:home")
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "zero root", "destinationId": "burnbar:home"}, "zero-root-r1")
+    )
+    assert received == []
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_signed_ratchet_init_with_wrong_responder_key_is_refused(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    raw, phone, payload = _signed_ratchet_init(adapter, k)
+    wrong_agent_pair = hr.generate_key_pair()
+    payload["responderRatchetPublicKeyBase64"] = wrong_agent_pair.public_key_base64
+    payload["responderDeviceID"] = hr.derive_device_id(wrong_agent_pair.public_key_base64)
+    payload["sessionID"] = hr.derive_session_id(
+        uid=_UID,
+        client_id=_CLIENT,
+        agent_ratchet_public_key_base64=wrong_agent_pair.public_key_base64,
+        peer_ratchet_public_key_base64=payload["initiatorRatchetPublicKeyBase64"],
+    )
+    raw = _phone_to_agent_v4_event(event_id="ratchet-init-wrong-agent", payload=payload, **k)
+    await adapter._handle_burnbar_event(raw)
+    assert not adapter._can_ratchet("burnbar:home")
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "should not open", "destinationId": "burnbar:home"}, "wrong-agent-r1")
+    )
+    assert received == []
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_unsigned_or_wrong_signer_ratchet_init_cannot_enable_ratchet(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    attacker_sig = v4.generate_signing_key()
+    raw, phone, payload = _signed_ratchet_init(adapter, k)
+    forged = _phone_to_agent_v4_event(
+        event_id="ratchet-init-wrong-signer",
+        payload=payload,
+        agent_enc=k["agent_enc"],
+        agent_sig=k["agent_sig"],
+        phone_enc=k["phone_enc"],
+        phone_sig=attacker_sig,
+    )
+    await adapter._handle_burnbar_event(forged)
+    assert not adapter._can_ratchet("burnbar:home")
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "wrong signer", "destinationId": "burnbar:home"}, "wrong-signer-r1")
+    )
+    assert adapter._ratchet_session("burnbar:home") is None
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_signed_ratchet_init_has_no_side_effect_until_replay_counter_commit(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    raw, _phone, payload = _signed_ratchet_init(adapter, k)
+    calls = {"count": 0}
+    real_record = adapter._record_event
+
+    def flaky_record(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return False
+        return real_record(*args, **kwargs)
+
+    adapter._record_event = flaky_record
+    await adapter._handle_burnbar_event(raw)
+    assert adapter._ratchet_session("burnbar:home") is None
+    await adapter._handle_burnbar_event(raw)
+    assert adapter._ratchet_session("burnbar:home").session_id == payload["sessionID"]
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_ratchet_session_without_lineage_marker_is_refused(monkeypatch):
+    monkeypatch.setenv("BURNBAR_RELAY_RATCHET", "1")
+    k = _keys()
+    adapter = _paired_v4_adapter(monkeypatch, **k)
+    raw, phone, payload = _signed_ratchet_init(adapter, k)
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    await adapter._handle_burnbar_event(raw)
+    assert adapter._can_ratchet("burnbar:home")
+    adapter._e2ee_state.clear_ratchet_lineage(payload["sessionID"])
+
+    assert not adapter._can_ratchet("burnbar:home")
+    await adapter._handle_burnbar_event(
+        _phone_ratchet_frame(phone, {"text": "no lineage", "destinationId": "burnbar:home"}, "no-lineage-r1")
+    )
+    assert received == []
 
 
 @requires_relay

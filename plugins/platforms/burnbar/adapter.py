@@ -17,6 +17,8 @@ server reports the link is relay-capable.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import copy
 import hashlib
@@ -41,6 +43,7 @@ except ImportError:  # pragma: no cover - Hermes installs httpx in core.
 try:
     from gateway.crypto import relay_e2ee
     from gateway.crypto import relay_e2ee_v4
+    from gateway.crypto import relay_e2ee_v5
     from gateway.crypto import hermes_ratchet
 
     RELAY_CRYPTO_AVAILABLE = True
@@ -51,6 +54,7 @@ except ImportError:  # pragma: no cover - exercised only when cryptography is ab
     RELAY_CRYPTO_AVAILABLE = False
     relay_e2ee = None  # type: ignore[assignment]
     relay_e2ee_v4 = None  # type: ignore[assignment]
+    relay_e2ee_v5 = None  # type: ignore[assignment]
     hermes_ratchet = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -127,6 +131,12 @@ GATEWAY_RELAY_ENCRYPTION_V4 = (
     if RELAY_CRYPTO_AVAILABLE
     else "hpke-auth-p256-ed25519sig-aes256gcm"
 )
+GATEWAY_RELAY_KEY_VERSION_V5 = relay_e2ee_v5.RELAY_KEY_VERSION_V5 if RELAY_CRYPTO_AVAILABLE else 5
+GATEWAY_RELAY_ENCRYPTION_V5 = (
+    relay_e2ee_v5.RELAY_ENCRYPTION_V5
+    if RELAY_CRYPTO_AVAILABLE
+    else "hpke-base-mlkem768-x25519-hkdfsha256-aes256gcm-ed25519sig"
+)
 # Gateway wrap versions the OPEN path will decrypt. The open path hard-refuses
 # any version outside this set (v1 and plaintext stay unreachable on a paired
 # link). This is deliberately INDEPENDENT of the break-glass flag and of
@@ -137,6 +147,7 @@ _OPENABLE_GATEWAY_RELAY_VERSIONS = (
     GATEWAY_RELAY_KEY_VERSION,
     GATEWAY_RELAY_KEY_VERSION_V3,
     GATEWAY_RELAY_KEY_VERSION_V4,
+    GATEWAY_RELAY_KEY_VERSION_V5,
 )
 # Operator/pairing-pinned peer wrap capability (authenticated, like
 # BURNBAR_RELAY_PEER_PUBLIC_KEY). Set to "3"/"4" once the paired peer is known to
@@ -146,17 +157,24 @@ RELAY_PEER_KEY_VERSION_ENV = "BURNBAR_RELAY_PEER_KEY_VERSION"
 # The peer's pinned Ed25519 signing key (base64 raw 32B), authenticated at pairing
 # and bound into the safety code. Required to emit/open v4. Never wire-supplied.
 RELAY_PEER_SIGNING_KEY_ENV = "BURNBAR_RELAY_PEER_SIGNING_KEY"
+RELAY_PEER_KEM_KEY_ENV = "BURNBAR_RELAY_PEER_KEM_PUBLIC_KEY"
 # Break-glass rollback flags: set to "1" to force the agent back to v2-only
 # (HPKE_V3_DISABLED) or to forbid v4 emission (V4_DISABLED) in an emergency.
 GATEWAY_HPKE_V3_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V3"
 GATEWAY_HPKE_V4_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V4"
-# Reserved opt-in flag for a future ratchet lane. The deterministic static-static
-# bootstrap is disabled until a v4-signed ratchet-init handshake authenticates the
-# first ratchet public key; the v4 signed envelope remains the production lane.
+GATEWAY_HPKE_V5_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V5"
+# Legacy opt-in flag kept for old deployments. Ratchet advertisement/session use
+# is now default-on because the bootstrap is signed (v4) or signed+PQ (v5); use
+# the explicit disable flag for break-glass rollback.
 RELAY_RATCHET_ENABLED_ENV = "BURNBAR_RELAY_RATCHET"
+RELAY_RATCHET_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_RATCHET"
 RATCHET_SESSION_FILE = Path(
     os.getenv("HERMES_BURNBAR_RATCHET_FILE", "~/.hermes/cache/burnbar_ratchet_sessions.json")
 ).expanduser()
+RATCHET_SESSION_SCHEMA_VERSION = 2
+RATCHET_INIT_KIND = "ratchet_init"
+RATCHET_INIT_VERSION = 1
+RATCHET_INIT_VERSION_V2 = 2
 BURNBAR_E2EE_STATE_FILE = Path(
     os.getenv("HERMES_BURNBAR_E2EE_STATE_FILE", str(DEFAULT_STATE_FILE))
 ).expanduser()
@@ -182,7 +200,9 @@ RELAY_PEER_KEY_EPOCH_ENV = "BURNBAR_RELAY_PEER_KEY_EPOCH"
 # Control-plane kinds. These ALWAYS travel on the v4-signed lane (with the
 # authenticated monotonic replayCounter gate) — never the ratchet chat lane, which
 # carries chat text only. A control kind arriving on the ratchet lane is refused.
-_CONTROL_EVENT_KINDS = frozenset({APPROVAL_DECISION_KIND, OVERSIGHT_MODE_KIND, KEY_ROTATION_KIND, "model_switch"})
+_CONTROL_EVENT_KINDS = frozenset(
+    {APPROVAL_DECISION_KIND, OVERSIGHT_MODE_KIND, KEY_ROTATION_KIND, RATCHET_INIT_KIND, "model_switch"}
+)
 
 
 def _agent_version() -> str:
@@ -265,6 +285,39 @@ def _relay_safety_code_v4(
             (relay_e2ee_v4.PAIRING_TAG_SIGNING, _b64.b64decode(phone_sig_b64, validate=True)),
         ]
         # Validate the signing keys are real Ed25519 points (32 bytes).
+        relay_e2ee_v4.RelayVerifyKey(self_keys[1][1])
+        relay_e2ee_v4.RelayVerifyKey(peer_keys[1][1])
+    except Exception:
+        return ""
+    return relay_e2ee_v4.relay_safety_code_v4(self_keys=self_keys, peer_keys=peer_keys)
+
+
+def _relay_safety_code_v5(
+    agent_enc_b64: str,
+    phone_enc_b64: str,
+    agent_sig_b64: str,
+    phone_sig_b64: str,
+    agent_kem_b64: str,
+    phone_kem_b64: str,
+) -> str:
+    """All-key v5 safety code: v4 keys plus the hybrid PQ KEM key class."""
+    if not RELAY_CRYPTO_AVAILABLE or relay_e2ee_v5 is None:
+        return ""
+    import base64 as _b64
+
+    try:
+        agent_kem = relay_e2ee_v5.RelayKemPublicKey.from_base64(agent_kem_b64)
+        phone_kem = relay_e2ee_v5.RelayKemPublicKey.from_base64(phone_kem_b64)
+        self_keys = [
+            (relay_e2ee_v4.PAIRING_TAG_ENCRYPTION, relay_e2ee.public_key_x963_from_base64(agent_enc_b64)),
+            (relay_e2ee_v4.PAIRING_TAG_SIGNING, _b64.b64decode(agent_sig_b64, validate=True)),
+            (relay_e2ee_v4.PAIRING_TAG_KEM, agent_kem.raw_representation),
+        ]
+        peer_keys = [
+            (relay_e2ee_v4.PAIRING_TAG_ENCRYPTION, relay_e2ee.public_key_x963_from_base64(phone_enc_b64)),
+            (relay_e2ee_v4.PAIRING_TAG_SIGNING, _b64.b64decode(phone_sig_b64, validate=True)),
+            (relay_e2ee_v4.PAIRING_TAG_KEM, phone_kem.raw_representation),
+        ]
         relay_e2ee_v4.RelayVerifyKey(self_keys[1][1])
         relay_e2ee_v4.RelayVerifyKey(peer_keys[1][1])
     except Exception:
@@ -446,12 +499,30 @@ def _gateway_hpke_v4_enabled() -> bool:
     return _gateway_hpke_v3_enabled() and (os.getenv(GATEWAY_HPKE_V4_DISABLED_ENV) or "").strip() != "1"
 
 
+def _gateway_hpke_v5_enabled() -> bool:
+    """True when the v5 hybrid-KEM signed wrap may be emitted/advertised."""
+    return (
+        _gateway_hpke_v4_enabled()
+        and (os.getenv(GATEWAY_HPKE_V5_DISABLED_ENV) or "").strip() != "1"
+        and RELAY_CRYPTO_AVAILABLE
+        and relay_e2ee_v5 is not None
+        and relay_e2ee_v5.is_supported()
+    )
+
+
+def _gateway_ratchet_disabled() -> bool:
+    """True when the signed ratchet-init lane is explicitly break-glass disabled."""
+    return (os.getenv(RELAY_RATCHET_DISABLED_ENV) or "").strip() == "1"
+
+
 def _supported_gateway_relay_versions() -> list[int]:
     versions = [GATEWAY_RELAY_KEY_VERSION]
     if _gateway_hpke_v3_enabled():
         versions.append(GATEWAY_RELAY_KEY_VERSION_V3)
     if _gateway_hpke_v4_enabled():
         versions.append(GATEWAY_RELAY_KEY_VERSION_V4)
+    if _gateway_hpke_v5_enabled():
+        versions.append(GATEWAY_RELAY_KEY_VERSION_V5)
     return versions
 
 
@@ -459,7 +530,20 @@ def _preferred_gateway_relay_version() -> int:
     return _supported_gateway_relay_versions()[-1]
 
 
+def _supported_gateway_relay_versions_for(agent_relay_kem_public_key: str | None = None) -> list[int]:
+    versions = _supported_gateway_relay_versions()
+    if not agent_relay_kem_public_key and GATEWAY_RELAY_KEY_VERSION_V5 in versions:
+        versions = [v for v in versions if v != GATEWAY_RELAY_KEY_VERSION_V5]
+    return versions
+
+
+def _preferred_gateway_relay_version_for(agent_relay_kem_public_key: str | None = None) -> int:
+    return _supported_gateway_relay_versions_for(agent_relay_kem_public_key)[-1]
+
+
 def _gateway_relay_encryption_for(version: int) -> str:
+    if version == GATEWAY_RELAY_KEY_VERSION_V5:
+        return GATEWAY_RELAY_ENCRYPTION_V5
     if version == GATEWAY_RELAY_KEY_VERSION_V4:
         return GATEWAY_RELAY_ENCRYPTION_V4
     if version == GATEWAY_RELAY_KEY_VERSION_V3:
@@ -467,22 +551,191 @@ def _gateway_relay_encryption_for(version: int) -> str:
     return RELAY_ENCRYPTION
 
 
-def _gateway_relay_capability_payload() -> dict:
+def _gateway_relay_capability_payload(
+    agent_ratchet_init_public_key: str | None = None,
+    agent_relay_kem_public_key: str | None = None,
+    agent_ratchet_init_kem_public_key: str | None = None,
+    agent_ratchet_init_kem_key_id: str | None = None,
+) -> dict:
     """The relay-capability fields published at device/start and runtime status.
 
     Advertises the gateway wrap versions this agent supports so an authenticated
-    peer can choose v3. This is advertisement only — it does not change any trust
-    decision; the open path version-dispatches on the envelope itself.
+    peer can choose v3/v4/v5. Ratchet fields are advertisement only: the receive
+    path still requires a signed ``ratchet_init`` before accepting any ratchet
+    frame.
     """
-    preferred = _preferred_gateway_relay_version()
-    supported = _supported_gateway_relay_versions()
-    return {
+    supported = _supported_gateway_relay_versions_for(agent_relay_kem_public_key)
+    preferred = supported[-1]
+    payload = {
         "supportsRelayEnvelopeVersions": supported,
         "preferredRelayEnvelopeVersion": preferred,
         "supportsHpkeV3": GATEWAY_RELAY_KEY_VERSION_V3 in supported,
         "supportsHpkeV4": GATEWAY_RELAY_KEY_VERSION_V4 in supported,
+        "supportsHpkeV5": GATEWAY_RELAY_KEY_VERSION_V5 in supported,
         "clientPlatform": "python-hermes-agent",
     }
+    if agent_relay_kem_public_key and GATEWAY_RELAY_KEY_VERSION_V5 in supported:
+        payload["agentRelayKemPublicKey"] = agent_relay_kem_public_key
+    if (
+        RELAY_CRYPTO_AVAILABLE
+        and hermes_ratchet is not None
+        and GATEWAY_RELAY_KEY_VERSION_V4 in supported
+        and agent_ratchet_init_public_key
+    ):
+        payload.update(
+            {
+                "supportsGatewayRatchetInit": True,
+                "gatewayRatchetInitVersion": RATCHET_INIT_VERSION,
+                "gatewayRatchetAlgorithm": hermes_ratchet.ALGORITHM,
+                "agentRatchetInitPublicKey": agent_ratchet_init_public_key,
+            }
+        )
+        if (
+            GATEWAY_RELAY_KEY_VERSION_V5 in supported
+            and agent_ratchet_init_kem_public_key
+            and agent_ratchet_init_kem_key_id
+        ):
+            payload.update(
+                {
+                    "gatewayRatchetInitVersion": RATCHET_INIT_VERSION_V2,
+                    "gatewayRatchetAlgorithm": hermes_ratchet.RATCHET_INIT_ALGORITHM_V2,
+                    "agentRatchetInitKemPublicKey": agent_ratchet_init_kem_public_key,
+                    "agentRatchetInitKemKeyID": agent_ratchet_init_kem_key_id,
+                }
+            )
+    else:
+        payload["supportsGatewayRatchetInit"] = False
+    return payload
+
+
+def _ratchet_init_key_pair_from_wire(value: object):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("ratchet init keypair must be an object")
+    pair = hermes_ratchet.HermesRatchetKeyPair.from_wire(value)
+    hermes_ratchet.validate_key_pair(pair)
+    return pair
+
+
+def _ratchet_init_kem_key_from_wire(value: object):
+    if value is None or relay_e2ee_v5 is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("ratchet init KEM key must be an object")
+    return relay_e2ee_v5.RelayKemPrivateKey.from_wire(value)
+
+
+def _load_ratchet_state_file() -> tuple[dict[str, Any], Any | None, Any | None]:
+    """Read the ratchet state file, tolerating the legacy destination->session map."""
+    try:
+        raw = json.loads(RATCHET_SESSION_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, None, None
+    except Exception:
+        raise
+    if not isinstance(raw, dict):
+        raise ValueError("ratchet state must be a JSON object")
+    if raw.get("_schemaVersion") == RATCHET_SESSION_SCHEMA_VERSION:
+        sessions = raw.get("sessions")
+        if sessions is not None and not isinstance(sessions, dict):
+            raise ValueError("ratchet sessions must be an object")
+        key_pair = _ratchet_init_key_pair_from_wire(raw.get("ratchetInitKeyPair"))
+        kem_key = _ratchet_init_kem_key_from_wire(raw.get("ratchetInitKemKeyPair"))
+        return (sessions if isinstance(sessions, dict) else {}), key_pair, kem_key
+    if "_schemaVersion" in raw:
+        raise ValueError(f"unsupported ratchet state schema {raw.get('_schemaVersion')!r}")
+    return raw, None, None
+
+
+def _write_ratchet_state_file(
+    *,
+    sessions: dict[str, Any],
+    init_key_pair: Any | None,
+    init_kem_key_pair: Any | None = None,
+) -> bool:
+    """Persist ratchet state with 0600 permissions and an fsynced atomic replace."""
+    try:
+        RATCHET_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(RATCHET_SESSION_FILE.parent, 0o700)
+        except OSError:
+            pass
+        data: dict[str, Any] = {
+            "_schemaVersion": RATCHET_SESSION_SCHEMA_VERSION,
+            "sessions": sessions,
+        }
+        if init_key_pair is not None:
+            data["ratchetInitKeyPair"] = init_key_pair.to_wire()
+        if init_kem_key_pair is not None:
+            data["ratchetInitKemKeyPair"] = init_kem_key_pair.to_wire()
+        tmp = RATCHET_SESSION_FILE.with_name(f"{RATCHET_SESSION_FILE.name}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps(data, separators=(",", ":")).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, RATCHET_SESSION_FILE)
+        dir_fd = os.open(RATCHET_SESSION_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return True
+    except Exception:
+        logger.warning("could not persist BurnBar ratchet state", exc_info=True)
+        return False
+
+
+def _load_or_create_ratchet_init_key_pair():
+    """Return the durable local ratchet-init key, creating it only when absent."""
+    if not RELAY_CRYPTO_AVAILABLE or hermes_ratchet is None:
+        return None
+    try:
+        sessions, key_pair, kem_key = _load_ratchet_state_file()
+    except Exception:
+        logger.warning("corrupt BurnBar ratchet init key; refusing to rotate silently", exc_info=True)
+        return None
+    if key_pair is not None:
+        return key_pair
+    key_pair = hermes_ratchet.generate_key_pair()
+    if _write_ratchet_state_file(sessions=sessions, init_key_pair=key_pair, init_kem_key_pair=kem_key):
+        return key_pair
+    return None
+
+
+def _load_or_create_ratchet_init_kem_key_pair():
+    """Return the durable local v2 ratchet-init KEM key, creating it only when absent."""
+    if not RELAY_CRYPTO_AVAILABLE or relay_e2ee_v5 is None or not _gateway_hpke_v5_enabled():
+        return None
+    try:
+        sessions, key_pair, kem_key = _load_ratchet_state_file()
+    except Exception:
+        logger.warning("corrupt BurnBar ratchet init KEM key; refusing to rotate silently", exc_info=True)
+        return None
+    if kem_key is not None:
+        return kem_key
+    kem_key = relay_e2ee_v5.generate_kem_private_key()
+    if _write_ratchet_state_file(sessions=sessions, init_key_pair=key_pair, init_kem_key_pair=kem_key):
+        return kem_key
+    return None
+
+
+def _ratchet_init_public_key_for_advertisement() -> Optional[str]:
+    if _gateway_ratchet_disabled():
+        return None
+    key_pair = _load_or_create_ratchet_init_key_pair()
+    return key_pair.public_key_base64 if key_pair is not None else None
+
+
+def _ratchet_init_kem_key_for_advertisement() -> tuple[Optional[str], Optional[str]]:
+    if _gateway_ratchet_disabled():
+        return None, None
+    key_pair = _load_or_create_ratchet_init_kem_key_pair()
+    if key_pair is None:
+        return None, None
+    return key_pair.public_key_base64(), key_pair.key_id()
 
 
 def _coerce_peer_relay_key_version(value: Any) -> int:
@@ -496,6 +749,12 @@ def _coerce_peer_relay_key_version(value: Any) -> int:
     counter = _coerce_replay_counter(value)
     if counter == GATEWAY_RELAY_KEY_VERSION:
         return counter
+    if counter == GATEWAY_RELAY_KEY_VERSION_V5:
+        if _gateway_hpke_v5_enabled():
+            return counter
+        return GATEWAY_RELAY_KEY_VERSION_V4 if _gateway_hpke_v4_enabled() else (
+            GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
+        )
     if counter == GATEWAY_RELAY_KEY_VERSION_V4:
         if _gateway_hpke_v4_enabled():
             return counter
@@ -504,6 +763,30 @@ def _coerce_peer_relay_key_version(value: Any) -> int:
         return GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
     if counter == GATEWAY_RELAY_KEY_VERSION_V3 and _gateway_hpke_v3_enabled():
         return counter
+    return GATEWAY_RELAY_KEY_VERSION
+
+
+def _coerce_peer_relay_key_version_floor(value: Any) -> int:
+    """Parse the authenticated inbound downgrade floor.
+
+    This is intentionally stricter than emission negotiation: a v5-pinned link
+    remains a v5 floor even if this process cannot currently emit/open v5 because a
+    local KEM seed is missing or the backend lacks ML-KEM. Only the explicit v5
+    break-glass flag lowers the floor.
+    """
+    counter = _coerce_replay_counter(value)
+    if counter == GATEWAY_RELAY_KEY_VERSION_V5:
+        if (os.getenv(GATEWAY_HPKE_V5_DISABLED_ENV) or "").strip() == "1":
+            return GATEWAY_RELAY_KEY_VERSION_V4 if _gateway_hpke_v4_enabled() else (
+                GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
+            )
+        return GATEWAY_RELAY_KEY_VERSION_V5
+    if counter == GATEWAY_RELAY_KEY_VERSION_V4:
+        if _gateway_hpke_v4_enabled():
+            return GATEWAY_RELAY_KEY_VERSION_V4
+        return GATEWAY_RELAY_KEY_VERSION_V3 if _gateway_hpke_v3_enabled() else GATEWAY_RELAY_KEY_VERSION
+    if counter == GATEWAY_RELAY_KEY_VERSION_V3 and _gateway_hpke_v3_enabled():
+        return GATEWAY_RELAY_KEY_VERSION_V3
     return GATEWAY_RELAY_KEY_VERSION
 
 
@@ -538,6 +821,8 @@ def _peer_relay_key_version_from_pairing_grant(approved: dict, client_payload: d
             marker = str(source.get(key) or "")
             if marker == GATEWAY_RELAY_ENCRYPTION_V4 and _gateway_hpke_v4_enabled():
                 best = max(best, GATEWAY_RELAY_KEY_VERSION_V4)
+            elif marker == GATEWAY_RELAY_ENCRYPTION_V5 and _gateway_hpke_v5_enabled():
+                best = max(best, GATEWAY_RELAY_KEY_VERSION_V5)
             elif marker == GATEWAY_RELAY_ENCRYPTION_V3 and _gateway_hpke_v3_enabled():
                 best = max(best, GATEWAY_RELAY_KEY_VERSION_V3)
     return best
@@ -1088,6 +1373,40 @@ class _RelaySealer:
             "senderSigningKey": signing_identity.public_key_base64,
         }
 
+    def _seal_signed_v5(
+        self,
+        *,
+        peer_kem: str,
+        destination_id: str,
+        payload_plaintext: bytes,
+        key_aad: bytes,
+        payload_aad: bytes,
+    ) -> dict:
+        """v5 hardened seal: hybrid-KEM HPKE content-key wrap + Ed25519 signature."""
+        peer_signing = self._adapter._peer_signing_key_for(destination_id)
+        signing_identity = self._adapter._ensure_signing_identity()
+        kem_identity = self._adapter._ensure_kem_identity()
+        if not peer_signing or signing_identity is None or kem_identity is None:
+            raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
+        env = relay_e2ee_v5.seal_signed_v5(
+            payload_plaintext,
+            recipient_kem_public=peer_kem,
+            recipient_verify_key=peer_signing,
+            sender_signing_key=signing_identity.signing_key,
+            key_aad=key_aad,
+            payload_aad=payload_aad,
+        )
+        return {
+            "payloadCiphertext": env.payload_ciphertext,
+            "wrappedKey": env.wrapped_key,
+            "enc": env.enc,
+            "senderSig": env.sender_sig,
+            "relayEncryption": env.relay_encryption,
+            "relayKeyVersion": env.relay_key_version,
+            "senderSigningKey": signing_identity.public_key_base64,
+            "senderKemPublicKey": kem_identity.public_key_base64,
+        }
+
     def _seal_ratchet(self, *, destination_id: str, payload_plaintext: bytes, message_id: str) -> dict:
         """Dormant sender for the future v4-signed ratchet-init lane.
 
@@ -1117,7 +1436,7 @@ class _RelaySealer:
         destination_id = str(raw.get("destinationId") or "")
         if not self._adapter._can_ratchet(destination_id):
             raise _RelayPlaintextRefused(
-                "ratchet lane is disabled until v4-signed ratchet initialization is implemented"
+                "ratchet lane is not initialized by a v4-signed ratchet_init"
             )
         base = self._adapter._ratchet_session(destination_id)
         if base is None:
@@ -1182,7 +1501,17 @@ class _RelaySealer:
         payload_bytes = json.dumps(payload).encode("utf-8")
         message_aad = _gateway_message_aad(self._uid, self._client_id, message_id)
         key_aad = _gateway_message_key_aad(self._uid, self._client_id, message_id)
-        if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
+        peer_version = self._adapter._peer_relay_key_version_for(destination_id)
+        if peer_version == GATEWAY_RELAY_KEY_VERSION_V5:
+            peer_kem = self._adapter._peer_kem_public_for(destination_id)
+            if not peer_kem:
+                raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
+            fields = self._seal_signed_v5(
+                peer_kem=peer_kem, destination_id=destination_id,
+                payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=message_aad,
+            )
+            return {**fields, "messageId": message_id}
+        if peer_version == GATEWAY_RELAY_KEY_VERSION_V4:
             fields = self._seal_signed_v4(
                 peer=peer, sender_private=sender_private, destination_id=destination_id,
                 payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=message_aad,
@@ -1339,7 +1668,17 @@ class _RelaySealer:
         }
         self._adapter._inject_outbound_replay_counter(destination_id, payload)
         payload_bytes = json.dumps(payload).encode("utf-8")
-        if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
+        peer_version = self._adapter._peer_relay_key_version_for(destination_id)
+        if peer_version == GATEWAY_RELAY_KEY_VERSION_V5:
+            peer_kem = self._adapter._peer_kem_public_for(destination_id)
+            if not peer_kem:
+                raise _RelayPlaintextRefused(self.cannot_seal_reason("switch the model"))
+            fields = self._seal_signed_v5(
+                peer_kem=peer_kem, destination_id=destination_id,
+                payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=payload_aad,
+            )
+            return {**fields, "eventId": event_id}
+        if peer_version == GATEWAY_RELAY_KEY_VERSION_V4:
             fields = self._seal_signed_v4(
                 peer=peer, sender_private=sender_private, destination_id=destination_id,
                 payload_plaintext=payload_bytes, key_aad=key_aad, payload_aad=payload_aad,
@@ -1397,6 +1736,45 @@ class _RelaySealer:
             payload_aad=payload_aad,
         )
 
+    def _open_signed_v5(
+        self, raw: dict, envelope: dict, key_aad: bytes, payload_aad: bytes
+    ) -> bytes:
+        """Open a v5 hybrid-KEM signed envelope using pinned KEM/signing keys."""
+        destination_id = str(raw.get("destinationId") or "")
+        peer_signing = self._adapter._peer_signing_key_for(destination_id)
+        signing_identity = self._adapter._ensure_signing_identity()
+        kem_private = self._adapter._relay_kem_private_key()
+        if not peer_signing or signing_identity is None or kem_private is None:
+            raise _RelayPlaintextRefused(
+                "refusing a v5 gateway envelope: local KEM/signing identities and "
+                "a pinned peer signing key are required to open"
+            )
+        relay_encryption = envelope.get("relayEncryption", raw.get("relayEncryption"))
+        if relay_encryption != GATEWAY_RELAY_ENCRYPTION_V5:
+            raise _RelayPlaintextRefused(
+                "refusing a v5 gateway envelope without the v5 relayEncryption marker"
+            )
+        enc = envelope.get("enc") or raw.get("enc")
+        sender_sig = envelope.get("senderSig") or raw.get("senderSig")
+        if not enc or not sender_sig:
+            raise _RelayPlaintextRefused(
+                "refusing a v5 gateway envelope missing its HPKE `enc` or `senderSig`"
+            )
+        v5_envelope = {
+            "enc": enc,
+            "wrappedKey": envelope["wrappedKey"],
+            "payloadCiphertext": envelope["payloadCiphertext"],
+            "senderSig": sender_sig,
+        }
+        return relay_e2ee_v5.open_signed_v5(
+            v5_envelope,
+            recipient_kem_private=kem_private,
+            recipient_verify_key=signing_identity.public_key_base64,
+            pinned_sender_verify_key=peer_signing,
+            key_aad=key_aad,
+            payload_aad=payload_aad,
+        )
+
     def _open_envelope(self, raw: dict, envelope: dict, private_key, payload_aad_builder, key_aad_builder) -> dict:
         """Unwrap + open one sealed envelope, then pin the peer key (TOFU/immutable).
 
@@ -1437,24 +1815,25 @@ class _RelaySealer:
         # (never the wire senderPublicKey), so a missing pin is refused too.
         if not pinned_phone or version_int not in _OPENABLE_GATEWAY_RELAY_VERSIONS:
             raise _RelayPlaintextRefused(
-                "refusing a non-v2/v3/v4 or unpinned gateway envelope: the authenticated "
+                "refusing a non-v2/v3/v4/v5 or unpinned gateway envelope: the authenticated "
                 "sender pin is required to open"
             )
         # Anti-downgrade FLOOR: on a link the authenticated pairing grant pinned to
-        # v4, refuse a v2/v3-labeled inbound frame explicitly BEFORE unwrap (a relay
-        # relabeling a v4 frame down to skip the Ed25519 check would otherwise be
-        # rejected only incidentally, by the later Padmé/JSON parse). Break-glass
-        # (v4 disabled) floors the pinned version to v3, so this never fires during
-        # a deliberate rollback.
-        pinned_version = self._adapter._peer_relay_key_version_for(
+        # v4/v5, refuse lower-version inbound frames explicitly BEFORE unwrap.
+        # Break-glass flags lower the effective inbound floor via
+        # _peer_relay_key_version_floor_for(), so deliberate rollback remains
+        # explicit. Emission fallback is intentionally not used here.
+        pinned_version = self._adapter._peer_relay_key_version_floor_for(
             str(raw.get("destinationId") or "")
         )
-        if pinned_version == GATEWAY_RELAY_KEY_VERSION_V4 and version_int < GATEWAY_RELAY_KEY_VERSION_V4:
+        if version_int < pinned_version:
             raise _RelayPlaintextRefused(
-                "refusing a downgraded gateway envelope: this link is pinned to v4 "
-                "(the explicit-signature wrap is required)"
+                f"refusing a downgraded gateway envelope: this link is pinned to v{pinned_version} "
+                f"but received v{version_int}"
             )
-        if version_int == GATEWAY_RELAY_KEY_VERSION_V4:
+        if version_int == GATEWAY_RELAY_KEY_VERSION_V5:
+            plaintext = self._open_signed_v5(raw, envelope, key_aad, payload_aad)
+        elif version_int == GATEWAY_RELAY_KEY_VERSION_V4:
             # v4: Ed25519 explicit signature (against the PINNED peer signing key)
             # AND the HPKE unwrap must both pass; the signature is checked first.
             plaintext = self._open_signed_v4(
@@ -1540,6 +1919,9 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._peer_relay_key_version_default: int = _coerce_peer_relay_key_version(
             os.getenv(RELAY_PEER_KEY_VERSION_ENV)
         )
+        self._peer_relay_key_version_floor_default: int = _coerce_peer_relay_key_version_floor(
+            os.getenv(RELAY_PEER_KEY_VERSION_ENV)
+        )
         # Per-destination wrap-version overrides, parallel to ``_peer_public_keys``.
         # Reserved for future multi-link pairing; today no flow populates it, so
         # every link resolves to ``_peer_relay_key_version_default`` below.
@@ -1566,17 +1948,38 @@ class BurnBarAdapter(BasePlatformAdapter):
                 )
                 self._peer_signing_key = None
         self._peer_signing_keys: Dict[str, str] = {}
+        # v5 hybrid-KEM identities. The local private seed is persisted in
+        # ~/.hermes/.env; the peer public key is authenticated at pairing and bound
+        # into the all-key safety code. Runtime wire fields never establish pins.
+        self._kem_identity = None
+        self._peer_kem_public_key: Optional[str] = (
+            os.getenv(RELAY_PEER_KEM_KEY_ENV) or ""
+        ).strip() or None
+        if self._peer_kem_public_key and RELAY_CRYPTO_AVAILABLE and relay_e2ee_v5 is not None:
+            try:
+                relay_e2ee_v5.RelayKemPublicKey.from_base64(self._peer_kem_public_key)
+            except Exception:
+                logger.warning(
+                    "[%s] %s is invalid; flooring this link to v4",
+                    self.name,
+                    RELAY_PEER_KEM_KEY_ENV,
+                )
+                self._peer_kem_public_key = None
+        self._peer_kem_public_keys: Dict[str, str] = {}
         # Monotonic rotation epoch of the pinned peer encryption key. An authenticated
         # key_rotation event must advance it by exactly 1; the replay high-water is
         # NOT reset on a swap, so an old frame stays refused across rotation.
         self._peer_relay_key_epoch: int = _coerce_replay_counter(
             os.getenv(RELAY_PEER_KEY_EPOCH_ENV)
         ) or 0
-        # Dormant Double Ratchet session cache, keyed by destination id. The old
-        # deterministic bootstrap remains behind a disabled gate until a v4-signed
-        # ratchet-init handshake replaces it.
+        # Double Ratchet state, keyed by destination id. Sessions are created only
+        # by a v4-signed ratchet_init control event; static-static rebootstrap is
+        # intentionally unreachable from the adapter.
         self._ratchet_sessions: Dict[str, Any] = {}
         self._ratchet_sessions_loaded = False
+        self._ratchet_init_key_pair = None
+        self._ratchet_init_kem_key_pair = None
+        self._ratchet_init_key_error = False
         # Only the long-running daemon owns the ratchet session store (stateful,
         # advanced per message). A one-shot standalone send sets this False and
         # falls back to the v4 signed wrap, so it can never race the daemon on the
@@ -1604,18 +2007,33 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._relay_uid_pinned = bool(env_uid)
         self._relay_client_id_pinned = bool(env_client_id)
         self._relay_e2e_config_error: Optional[str] = None
+        raw_peer_version = _coerce_replay_counter(os.getenv(RELAY_PEER_KEY_VERSION_ENV))
+        if (
+            self._relay_e2e_enabled
+            and raw_peer_version == GATEWAY_RELAY_KEY_VERSION_V5
+            and not _gateway_hpke_v5_enabled()
+            and (os.getenv(GATEWAY_HPKE_V5_DISABLED_ENV) or "").strip() != "1"
+        ):
+            self._relay_e2e_config_error = (
+                "end-to-end encryption is pinned to gateway relay v5 but this "
+                "installation does not expose cryptography HPKE MLKEM768_X25519; "
+                "install the gateway-e2ee extra with cryptography>=48 or set "
+                f"{GATEWAY_HPKE_V5_DISABLED_ENV}=1 for an explicit v4 break-glass rollback"
+            )
+            logger.error("[%s] SECURITY: %s", self.name, self._relay_e2e_config_error)
         if self._relay_e2e_enabled and (not self._relay_uid_pinned or not self._relay_client_id_pinned):
             missing = []
             if not self._relay_uid_pinned:
                 missing.append("BURNBAR_RELAY_UID")
             if not self._relay_client_id_pinned:
                 missing.append("BURNBAR_RELAY_CLIENT_ID")
-            self._relay_e2e_config_error = (
+            uid_error = (
                 "end-to-end encryption is enabled but the authenticated pairing grant "
                 f"did not persist {', '.join(missing)}; refusing the relay link until "
                 "you re-run setup with a gateway that returns uid and clientId"
             )
-            logger.error("[%s] SECURITY: %s", self.name, self._relay_e2e_config_error)
+            self._relay_e2e_config_error = self._relay_e2e_config_error or uid_error
+            logger.error("[%s] SECURITY: %s", self.name, uid_error)
         # MP-5: explicit operator opt-in to the legacy plaintext relay path even
         # though this agent is E2E-capable (holds a persisted relay identity).
         self._plaintext_explicitly_allowed = (os.getenv("BURNBAR_ALLOW_PLAINTEXT") or "").strip() == "1"
@@ -1723,6 +2141,38 @@ class BurnBarAdapter(BasePlatformAdapter):
             self._signing_identity = None
         return self._signing_identity
 
+    def _ensure_kem_identity(self):
+        """Load (or create+persist) the agent's v5 hybrid-KEM identity."""
+        if not RELAY_CRYPTO_AVAILABLE or relay_e2ee_v5 is None or not _gateway_hpke_v5_enabled():
+            return None
+        if self._kem_identity is not None:
+            return self._kem_identity
+        persist = self._relay_key_persister()
+        try:
+            self._kem_identity = relay_e2ee_v5.AgentKemIdentity.load_or_create(
+                env_var=relay_e2ee_v5.RELAY_KEM_PRIVATE_KEY_ENV,
+                persist=persist,
+            )
+        except relay_e2ee.CorruptIdentityError:
+            logger.error(
+                "[%s] corrupt KEM key; refusing v5 (re-pair or delete the key)", self.name
+            )
+            raise
+        except Exception:
+            logger.debug("[%s] Could not load v5 KEM identity", self.name, exc_info=True)
+            self._kem_identity = None
+        return self._kem_identity
+
+    def _relay_kem_private_key(self):
+        identity = self._ensure_kem_identity()
+        if identity is None:
+            return None
+        return getattr(identity, "private_key", identity)
+
+    def _relay_kem_public_key_base64(self) -> Optional[str]:
+        identity = self._ensure_kem_identity()
+        return identity.public_key_base64 if identity is not None else None
+
     def _peer_signing_key_for(self, destination_id: str) -> Optional[str]:
         """The peer's PINNED Ed25519 verification key for one destination (pairing-
         pinned; never a wire field). Required to emit/open v4."""
@@ -1731,33 +2181,46 @@ class BurnBarAdapter(BasePlatformAdapter):
     def _peer_relay_public_for(self, destination_id: str) -> Optional[str]:
         return self._peer_public_keys.get(str(destination_id or "")) or self._peer_public_key
 
+    def _peer_kem_public_for(self, destination_id: str) -> Optional[str]:
+        return self._peer_kem_public_keys.get(str(destination_id or "")) or self._peer_kem_public_key
+
     def _ratchet_enabled(self) -> bool:
-        # Disabled until the first ratchet public key is authenticated inside a
-        # v4-signed ratchet-init handshake. Deterministic static-static bootstrap
-        # lets a recipient-static-key holder forge the initiator.
-        return False
+        return (
+            RELAY_CRYPTO_AVAILABLE
+            and hermes_ratchet is not None
+            and self._ratchet_allowed
+            and not _gateway_ratchet_disabled()
+        )
+
+    def _ratchet_session_is_rolled_back(self, session) -> bool:
+        try:
+            session_id = str(session.session_id)
+            receive_number = int(session.receive_message_number)
+        except Exception:
+            return True
+        high_water = self._e2ee_state.get_ratchet_receive_high_water(session_id)
+        return receive_number < high_water
 
     def _can_ratchet(self, destination_id: str) -> bool:
-        """True when the CHAT lane should use the Double Ratchet: opt-in flag set,
-        the link negotiated v4, and the agent + pinned-peer relay keys (reused as
-        the ratchet bootstrap identities) are present."""
-        return (
-            self._ratchet_enabled()
-            and self._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4
-            and self._relay_private_key() is not None
-            and bool(self._peer_relay_public_for(destination_id))
-        )
+        """True when this destination has an authenticated ratchet session."""
+        if (
+            not self._ratchet_enabled()
+            or self._peer_relay_key_version_for(destination_id) < GATEWAY_RELAY_KEY_VERSION_V4
+            or not self._relay_e2e_enabled
+            or self._relay_private_key() is None
+            or not self._peer_relay_public_for(destination_id)
+            or not self._peer_signing_key_for(destination_id)
+        ):
+            return False
+        session = self._ratchet_session(destination_id)
+        if session is not None and self._ratchet_session_is_rolled_back(session):
+            logger.warning("[%s] refusing rolled-back ratchet session for %s", self.name, destination_id)
+            return False
+        return session is not None and self._ratchet_session_was_established(str(session.session_id))
 
     def _ratchet_session_id(self, destination_id: str) -> Optional[str]:
-        relay_key = self._relay_private_key()
-        peer_pub = self._peer_relay_public_for(destination_id)
-        if relay_key is None or not peer_pub:
-            return None
-        return hermes_ratchet.derive_session_id(
-            uid=self._relay_uid, client_id=self._relay_client_id,
-            agent_ratchet_public_key_base64=relay_key.public_key_base64(),
-            peer_ratchet_public_key_base64=peer_pub,
-        )
+        session = self._ratchet_session(destination_id)
+        return str(session.session_id) if session is not None else None
 
     def _ratchet_session_was_established(self, session_id: str) -> bool:
         return self._e2ee_state.ratchet_lineage_exists(session_id)
@@ -1766,57 +2229,83 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._e2ee_state.mark_ratchet_lineage(session_id)
 
     def _ratchet_session(self, destination_id: str):
-        """Return a cached/persisted dormant ratchet session for one destination.
+        """Return a cached/persisted ratchet session for one destination.
 
-        The old deterministic bootstrap is retained only behind the disabled
-        ratchet gate. Production ratchet must use a v4-signed init handshake; a
-        missing/corrupt session must never silently re-bootstrap from static keys."""
+        A missing session is not reconstructed from static keys. The only adapter
+        entrypoint that creates a session is ``_handle_sealed_ratchet_init`` after
+        the v4 signed lane authenticates the init payload.
+        """
         self._load_ratchet_sessions()
-        key = str(destination_id or "")
-        session = self._ratchet_sessions.get(key)
-        if session is not None:
-            return session
-        relay_key = self._relay_private_key()
-        peer_pub = self._peer_relay_public_for(destination_id)
-        if relay_key is None or not peer_pub:
+        session = self._ratchet_sessions.get(str(destination_id or ""))
+        if session is not None and self._ratchet_session_is_rolled_back(session):
             return None
-        session_id = hermes_ratchet.derive_session_id(
-            uid=self._relay_uid, client_id=self._relay_client_id,
-            agent_ratchet_public_key_base64=relay_key.public_key_base64(),
-            peer_ratchet_public_key_base64=peer_pub,
-        )
-        if self._ratchet_session_was_established(session_id):
-            logger.warning(
-                "[%s] ratchet session was lost from the session store; refusing a "
-                "silent re-bootstrap (rotate keys to restore the ratchet chat lane)",
-                self.name,
-            )
-            return None
-        local_pair = hermes_ratchet.HermesRatchetKeyPair(
-            private_key_base64=relay_key.raw_base64(),
-            public_key_base64=relay_key.public_key_base64(),
-        )
-        session = hermes_ratchet.bootstrap_session(
-            role=hermes_ratchet.HermesRatchetRole.RESPONDER,  # the agent replies to the user
-            uid=self._relay_uid, client_id=self._relay_client_id,
-            local_ratchet_key_pair=local_pair, peer_ratchet_public_key_base64=peer_pub,
-        )
-        self._mark_ratchet_session_established(session_id)
-        self._ratchet_sessions[key] = session
-        self._save_ratchet_sessions()
         return session
+
+    def _ensure_ratchet_init_key_pair(self):
+        if not self._ratchet_enabled() or self._ratchet_init_key_error:
+            return None
+        self._load_ratchet_sessions()
+        if self._ratchet_init_key_error:
+            return None
+        if self._ratchet_init_key_pair is not None:
+            return self._ratchet_init_key_pair
+        key_pair = hermes_ratchet.generate_key_pair()
+        self._ratchet_init_key_pair = key_pair
+        if self._save_ratchet_sessions():
+            return key_pair
+        self._ratchet_init_key_pair = None
+        return None
+
+    def _ensure_ratchet_init_kem_key_pair(self):
+        if not self._ratchet_enabled() or self._ratchet_init_key_error or not _gateway_hpke_v5_enabled():
+            return None
+        self._load_ratchet_sessions()
+        if self._ratchet_init_key_error:
+            return None
+        if self._ratchet_init_kem_key_pair is not None:
+            return self._ratchet_init_kem_key_pair
+        if relay_e2ee_v5 is None:
+            return None
+        key_pair = relay_e2ee_v5.generate_kem_private_key()
+        self._ratchet_init_kem_key_pair = key_pair
+        if self._save_ratchet_sessions():
+            return key_pair
+        self._ratchet_init_kem_key_pair = None
+        return None
+
+    def _ratchet_init_public_key_for_advertisement(self) -> Optional[str]:
+        key_pair = self._ensure_ratchet_init_key_pair()
+        return key_pair.public_key_base64 if key_pair is not None else None
+
+    def _ratchet_init_kem_key_for_advertisement(self) -> tuple[Optional[str], Optional[str]]:
+        key_pair = self._ensure_ratchet_init_kem_key_pair()
+        if key_pair is None:
+            return None, None
+        return key_pair.public_key_base64(), key_pair.key_id()
 
     def _load_ratchet_sessions(self) -> None:
         if self._ratchet_sessions_loaded:
             return
         self._ratchet_sessions_loaded = True
         try:
-            raw = json.loads(RATCHET_SESSION_FILE.read_text(encoding="utf-8"))
+            raw_sessions, init_key_pair, init_kem_key_pair = _load_ratchet_state_file()
         except Exception:
+            self._ratchet_init_key_error = True
+            logger.warning("[%s] corrupt ratchet state; refusing ratchet lane", self.name, exc_info=True)
             return
-        for key, wire in (raw or {}).items():
+        self._ratchet_init_key_pair = init_key_pair
+        self._ratchet_init_kem_key_pair = init_kem_key_pair
+        for key, wire in (raw_sessions or {}).items():
             try:
-                self._ratchet_sessions[str(key)] = hermes_ratchet.HermesRatchetSessionState.from_wire(wire)
+                session = hermes_ratchet.HermesRatchetSessionState.from_wire(wire)
+                if self._ratchet_session_is_rolled_back(session):
+                    logger.warning(
+                        "[%s] dropped rolled-back ratchet session %s from disk",
+                        self.name,
+                        session.session_id,
+                    )
+                    continue
+                self._ratchet_sessions[str(key)] = session
             except Exception:
                 continue
 
@@ -1827,21 +2316,15 @@ class BurnBarAdapter(BasePlatformAdapter):
         durable write — callers FAIL CLOSED on False so a message is never sent or
         delivered with a ratchet advance that is not yet on disk (which would risk a
         message-number reuse on send or a replay window on receive after a crash)."""
-        try:
-            RATCHET_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            data = {k: v.to_wire() for k, v in self._ratchet_sessions.items()}
-            tmp = RATCHET_SESSION_FILE.with_name(f"{RATCHET_SESSION_FILE.name}.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                os.write(fd, json.dumps(data).encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.replace(tmp, RATCHET_SESSION_FILE)
-            return True
-        except Exception:
-            logger.warning("[%s] could not persist ratchet sessions", self.name, exc_info=True)
-            return False
+        data = {k: v.to_wire() for k, v in self._ratchet_sessions.items()}
+        ok = _write_ratchet_state_file(
+            sessions=data,
+            init_key_pair=self._ratchet_init_key_pair,
+            init_kem_key_pair=self._ratchet_init_kem_key_pair,
+        )
+        if not ok:
+            logger.warning("[%s] could not persist ratchet sessions", self.name)
+        return ok
 
     def _commit_ratchet_session(self, destination_id: str, session) -> bool:
         """Atomically commit an advanced session: persist it to disk FIRST, and only
@@ -1857,6 +2340,28 @@ class BurnBarAdapter(BasePlatformAdapter):
             self._ratchet_sessions.pop(key, None)
         else:
             self._ratchet_sessions[key] = prior
+        return False
+
+    def _commit_ratchet_init_v2_session(self, destination_id: str, session, next_kem_key) -> bool:
+        """Commit a v2 ratchet init session and consume the KEM init key atomically.
+
+        The ratchet session file holds both the session and the advertised KEM
+        init private seed. Rotating the KEM key in the same fsynced replace that
+        stores the session prevents a captured init ciphertext from being replayed
+        after a cache rollback.
+        """
+        key = str(destination_id or "")
+        prior_session = self._ratchet_sessions.get(key)
+        prior_kem = self._ratchet_init_kem_key_pair
+        self._ratchet_sessions[key] = session
+        self._ratchet_init_kem_key_pair = next_kem_key
+        if self._save_ratchet_sessions():
+            return True
+        if prior_session is None:
+            self._ratchet_sessions.pop(key, None)
+        else:
+            self._ratchet_sessions[key] = prior_session
+        self._ratchet_init_kem_key_pair = prior_kem
         return False
 
     def _relay_public_key_base64(self) -> Optional[str]:
@@ -2062,10 +2567,10 @@ class BurnBarAdapter(BasePlatformAdapter):
         )
 
     def _inject_outbound_replay_counter(self, destination_id: str, payload: Dict[str, Any]) -> None:
-        """Reserve a monotonic outbound counter for the v4 signed lane."""
+        """Reserve a monotonic outbound counter for explicit-signature lanes."""
         if self._relay_e2e_config_error:
             raise _RelayPlaintextRefused(self._relay_e2e_config_error)
-        if self._peer_relay_key_version_for(destination_id) != GATEWAY_RELAY_KEY_VERSION_V4:
+        if self._peer_relay_key_version_for(destination_id) < GATEWAY_RELAY_KEY_VERSION_V4:
             return
         try:
             payload["replayCounter"] = self._e2ee_state.reserve_outbound_counter(
@@ -2216,18 +2721,28 @@ class BurnBarAdapter(BasePlatformAdapter):
     def _peer_relay_key_version_for(self, destination_id: str) -> int:
         """Resolve the relay key-wrap version to EMIT for one destination.
 
-        Returns v3 only when the authenticated capability (the
+        Returns v5/v4/v3 only when the authenticated capability (the
         ``BURNBAR_RELAY_PEER_KEY_VERSION`` pin, or a per-destination override in
         ``_peer_relay_key_versions`` when one is present) says the paired peer
-        supports it; otherwise the v2 floor. A v2-only peer is NEVER auto-upgraded,
-        and an unsupported value floors to v2 — so this only ever selects a wrap
-        version both sides implement. This gates emission only; the open path
-        dispatches on the envelope's own ``relayKeyVersion`` and always binds the
-        pinned sender, independent of this value.
+        supports it and the local identities required to emit that version exist;
+        otherwise the v2 floor. A v2-only peer is NEVER auto-upgraded, and an
+        unsupported value floors to v2 — so this only ever selects a wrap version
+        both sides implement. This gates emission only; the open path uses the
+        stricter inbound floor resolver and always binds the pinned sender.
         """
         version = self._peer_relay_key_versions.get(str(destination_id or ""))
         if version is None:
             version = self._peer_relay_key_version_default
+        if version == GATEWAY_RELAY_KEY_VERSION_V5:
+            if (
+                _gateway_hpke_v5_enabled()
+                and self._ensure_signing_identity() is not None
+                and self._peer_signing_key_for(destination_id)
+                and self._ensure_kem_identity() is not None
+                and self._peer_kem_public_for(destination_id)
+            ):
+                return GATEWAY_RELAY_KEY_VERSION_V5
+            version = GATEWAY_RELAY_KEY_VERSION_V4
         # v4 emission additionally requires the agent's signing identity AND the
         # peer's pinned signing key; without either, fall back to the v3 wrap.
         if version == GATEWAY_RELAY_KEY_VERSION_V4:
@@ -2243,6 +2758,19 @@ class BurnBarAdapter(BasePlatformAdapter):
         if version in _OPENABLE_GATEWAY_RELAY_VERSIONS:
             return version
         return GATEWAY_RELAY_KEY_VERSION
+
+    def _peer_relay_key_version_floor_for(self, destination_id: str) -> int:
+        """Resolve the inbound anti-downgrade floor for one destination.
+
+        This honors the authenticated/persisted peer pin even if emission must
+        temporarily fall back because a local identity is unavailable. That keeps a
+        v5 pin fail-closed: v4 frames are refused unless the operator explicitly set
+        the v5 break-glass flag before startup.
+        """
+        version = self._peer_relay_key_versions.get(str(destination_id or ""))
+        if version is None:
+            return self._peer_relay_key_version_floor_default
+        return _coerce_peer_relay_key_version_floor(version)
 
     async def connect(self) -> bool:
         if not HTTPX_AVAILABLE:
@@ -2355,9 +2883,8 @@ class BurnBarAdapter(BasePlatformAdapter):
                 logger.warning("[%s] dropped sealed event without authenticated destinationId", self.name)
                 return
             destination_id = sealed_dest or destination_id
-            # The ratchet branch is unreachable while the lane is disabled. If it
-            # returns with a signed init handshake, it remains chat-only; controls
-            # stay on the v4 signed lane with the replayCounter gate.
+            # Ratchet remains chat-only after signed init; controls stay on the v4
+            # signed lane with the replayCounter gate.
             is_ratchet = isinstance(raw.get("ratchetEnvelope"), dict)
             if is_ratchet and (kind in _CONTROL_EVENT_KINDS or authed.get("modelId") is not None):
                 logger.warning(
@@ -2389,10 +2916,16 @@ class BurnBarAdapter(BasePlatformAdapter):
                     return
                 self._handle_sealed_oversight_mode(authed)
                 return
-            if kind == KEY_ROTATION_KIND:
-                if not self._handle_sealed_key_rotation(authed):
-                    return
+            if kind == RATCHET_INIT_KIND:
                 if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id):
+                    return
+                if not self._handle_sealed_ratchet_init(authed):
+                    return
+                return
+            if kind == KEY_ROTATION_KIND:
+                if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id):
+                    return
+                if not self._handle_sealed_key_rotation(authed):
                     return
                 return
             # model_switch is opened as an ordinary sealed event (via open_event)
@@ -2430,9 +2963,8 @@ class BurnBarAdapter(BasePlatformAdapter):
         # MP-3: record the authenticated id ONLY now — after a successful open and
         # before dispatch — so only events that actually authenticated consume a
         # cache slot. The signed/legacy lanes rely on this id ledger as their replay
-        # anchor, so a failed record drops the event. The ratchet branch is
-        # unreachable while disabled; if it returns with signed init, its durable
-        # message-key advance remains the authoritative replay defense.
+        # anchor, so a failed record drops the event. Ratchet chat frames use their
+        # durable message-key advance as the authoritative replay defense.
         if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id) and not is_ratchet:
             return
         # MP-8: on an E2E-authenticated event, sender identity MUST come from the
@@ -2496,14 +3028,23 @@ class BurnBarAdapter(BasePlatformAdapter):
         if RELAY_CRYPTO_AVAILABLE and self._relay_e2e_enabled:
             pub = self._relay_public_key_base64()
             if pub:
-                preferred_gateway_relay_version = _preferred_gateway_relay_version()
+                agent_kem_public = self._relay_kem_public_key_base64()
+                preferred_gateway_relay_version = _preferred_gateway_relay_version_for(agent_kem_public)
                 body["relayPublicKey"] = pub
                 body["relayEncryption"] = RELAY_ENCRYPTION
                 body["relayKeyVersion"] = RELAY_KEY_VERSION
                 body["gatewayRelayKeyVersion"] = preferred_gateway_relay_version
                 body["gatewayRelayEncryption"] = _gateway_relay_encryption_for(preferred_gateway_relay_version)
-                body["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions()
-                body.update(_gateway_relay_capability_payload())
+                body["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions_for(agent_kem_public)
+                ratchet_kem_pub, ratchet_kem_key_id = self._ratchet_init_kem_key_for_advertisement()
+                body.update(
+                    _gateway_relay_capability_payload(
+                        self._ratchet_init_public_key_for_advertisement(),
+                        agent_kem_public,
+                        ratchet_kem_pub,
+                        ratchet_kem_key_id,
+                    )
+                )
                 signing = self._ensure_signing_identity()
                 if signing is not None:
                     body["agentRelaySigningKey"] = signing.public_key_base64
@@ -2715,6 +3256,256 @@ class BurnBarAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Could not persist BurnBar oversight mode", self.name, exc_info=True)
 
+    def _handle_sealed_ratchet_init(self, authed: dict) -> bool:
+        """Create a ratchet responder session from a v4-signed init payload.
+
+        The payload has already been opened by the v4 signed gateway lane and will
+        later pass the signed replay-counter commit. This method binds the init to
+        the local durable ratchet key, the routing ids, the derived session/device
+        ids, and the current v4-pinned peer before any ratchet state is accepted.
+        """
+        if not self._ratchet_enabled():
+            logger.warning("[%s] dropped ratchet_init: ratchet lane disabled by policy", self.name)
+            return False
+        destination_id = str(authed.get("destinationId") or "").strip()
+        if not destination_id:
+            logger.warning("[%s] dropped ratchet_init: missing destinationId", self.name)
+            return False
+        try:
+            version = int(authed.get("ratchetInitVersion"))
+        except (TypeError, ValueError):
+            version = 0
+        if version == RATCHET_INIT_VERSION_V2:
+            return self._handle_sealed_ratchet_init_v2(authed, destination_id)
+        if self._peer_relay_key_version_for(destination_id) != GATEWAY_RELAY_KEY_VERSION_V4:
+            logger.warning("[%s] dropped ratchet_init: v1 link is not pinned to v4", self.name)
+            return False
+        local_pair = self._ensure_ratchet_init_key_pair()
+        if local_pair is None:
+            logger.warning("[%s] dropped ratchet_init: no durable local ratchet init key", self.name)
+            return False
+        if version != RATCHET_INIT_VERSION:
+            logger.warning("[%s] dropped ratchet_init: unsupported version %r", self.name, authed.get("ratchetInitVersion"))
+            return False
+        if str(authed.get("algorithm") or "") != hermes_ratchet.ALGORITHM:
+            logger.warning("[%s] dropped ratchet_init: unsupported algorithm", self.name)
+            return False
+        if str(authed.get("uid") or "") != self._relay_uid or str(authed.get("clientId") or "") != self._relay_client_id:
+            logger.warning("[%s] dropped ratchet_init: uid/clientId mismatch", self.name)
+            return False
+
+        initiator_pub = str(authed.get("initiatorRatchetPublicKeyBase64") or "")
+        responder_pub = str(authed.get("responderRatchetPublicKeyBase64") or "")
+        if responder_pub != local_pair.public_key_base64:
+            logger.warning("[%s] dropped ratchet_init: responder ratchet key is not this agent's key", self.name)
+            return False
+        if initiator_pub == responder_pub:
+            logger.warning("[%s] dropped ratchet_init: initiator/responder ratchet keys are identical", self.name)
+            return False
+        try:
+            hermes_ratchet.validate_public_key_base64(initiator_pub)
+            hermes_ratchet.validate_public_key_base64(responder_pub)
+            root_key = base64.b64decode(str(authed.get("rootKeyBase64") or ""), validate=True)
+        except (ValueError, binascii.Error, hermes_ratchet.HermesRatchetError):
+            logger.warning("[%s] dropped ratchet_init: malformed key material", self.name)
+            return False
+        if len(root_key) != 32:
+            logger.warning("[%s] dropped ratchet_init: root key length is invalid", self.name)
+            return False
+        if not any(root_key):
+            logger.warning("[%s] dropped ratchet_init: root key is all zero", self.name)
+            return False
+
+        expected_session_id = hermes_ratchet.derive_session_id(
+            uid=self._relay_uid,
+            client_id=self._relay_client_id,
+            agent_ratchet_public_key_base64=responder_pub,
+            peer_ratchet_public_key_base64=initiator_pub,
+        )
+        if str(authed.get("sessionID") or "") != expected_session_id:
+            logger.warning("[%s] dropped ratchet_init: sessionID mismatch", self.name)
+            return False
+        initiator_device = hermes_ratchet.derive_device_id(initiator_pub)
+        responder_device = hermes_ratchet.derive_device_id(responder_pub)
+        if (
+            str(authed.get("initiatorDeviceID") or "") != initiator_device
+            or str(authed.get("responderDeviceID") or "") != responder_device
+        ):
+            logger.warning("[%s] dropped ratchet_init: device id mismatch", self.name)
+            return False
+
+        existing = self._ratchet_session(destination_id)
+        if existing is not None:
+            if existing.session_id == expected_session_id:
+                return True
+            logger.warning("[%s] dropped ratchet_init: refusing to replace active ratchet session", self.name)
+            return False
+        if self._ratchet_session_was_established(expected_session_id):
+            logger.warning(
+                "[%s] dropped ratchet_init: session lineage exists but session state is missing",
+                self.name,
+            )
+            return False
+
+        try:
+            session = hermes_ratchet.responder_state(
+                session_id=expected_session_id,
+                local_device_id=responder_device,
+                remote_device_id=initiator_device,
+                shared_secret=root_key,
+                local_initial_ratchet_key_pair=local_pair,
+            )
+        except hermes_ratchet.HermesRatchetError:
+            logger.warning("[%s] dropped ratchet_init: could not create responder session", self.name, exc_info=True)
+            return False
+        if not self._commit_ratchet_session(destination_id, session):
+            return False
+        try:
+            self._mark_ratchet_session_established(expected_session_id)
+        except Exception:
+            logger.warning("[%s] could not mark ratchet lineage; rolling back session", self.name, exc_info=True)
+            self._ratchet_sessions.pop(destination_id, None)
+            self._save_ratchet_sessions()
+            return False
+        logger.info("[%s] established v4-signed ratchet session for %s", self.name, destination_id)
+        return True
+
+    def _handle_sealed_ratchet_init_v2(self, authed: dict, destination_id: str) -> bool:
+        """Create a ratchet responder session from a v5-signed PQ KEM init."""
+        if self._peer_relay_key_version_for(destination_id) != GATEWAY_RELAY_KEY_VERSION_V5:
+            logger.warning("[%s] dropped ratchet_init v2: link is not pinned to v5", self.name)
+            return False
+        if authed.get("rootKeyBase64") is not None:
+            logger.warning("[%s] dropped ratchet_init v2: transmitted root keys are forbidden", self.name)
+            return False
+        local_pair = self._ensure_ratchet_init_key_pair()
+        local_kem = self._ensure_ratchet_init_kem_key_pair()
+        if local_pair is None or local_kem is None or relay_e2ee_v5 is None:
+            logger.warning("[%s] dropped ratchet_init v2: local ratchet init keys unavailable", self.name)
+            return False
+        if str(authed.get("algorithm") or "") != hermes_ratchet.RATCHET_INIT_ALGORITHM_V2:
+            logger.warning("[%s] dropped ratchet_init v2: unsupported algorithm", self.name)
+            return False
+        if str(authed.get("uid") or "") != self._relay_uid or str(authed.get("clientId") or "") != self._relay_client_id:
+            logger.warning("[%s] dropped ratchet_init v2: uid/clientId mismatch", self.name)
+            return False
+
+        initiator_pub = str(authed.get("initiatorRatchetPublicKeyBase64") or "")
+        responder_pub = str(authed.get("responderRatchetPublicKeyBase64") or "")
+        responder_kem_pub = str(authed.get("responderKemPublicKeyBase64") or "")
+        responder_kem_key_id = str(authed.get("responderKemKeyID") or "")
+        kem_ciphertext_b64 = str(authed.get("kemCiphertextBase64") or "")
+        root_confirm_b64 = str(authed.get("rootConfirmMacBase64") or "")
+        replay_counter = _coerce_replay_counter(authed.get("replayCounter"))
+        if replay_counter is None:
+            logger.warning("[%s] dropped ratchet_init v2: missing replayCounter", self.name)
+            return False
+        if responder_pub != local_pair.public_key_base64:
+            logger.warning("[%s] dropped ratchet_init v2: responder ratchet key is not this agent's key", self.name)
+            return False
+        if initiator_pub == responder_pub:
+            logger.warning("[%s] dropped ratchet_init v2: initiator/responder ratchet keys are identical", self.name)
+            return False
+        if responder_kem_pub != local_kem.public_key_base64() or responder_kem_key_id != local_kem.key_id():
+            logger.warning("[%s] dropped ratchet_init v2: responder KEM key is not the advertised key", self.name)
+            return False
+        try:
+            hermes_ratchet.validate_public_key_base64(initiator_pub)
+            hermes_ratchet.validate_public_key_base64(responder_pub)
+            relay_e2ee_v5.RelayKemPublicKey.from_base64(responder_kem_pub)
+            kem_ciphertext = base64.b64decode(kem_ciphertext_b64, validate=True)
+            root_confirm = base64.b64decode(root_confirm_b64, validate=True)
+        except (ValueError, binascii.Error, hermes_ratchet.HermesRatchetError, relay_e2ee.RelayCryptoError):
+            logger.warning("[%s] dropped ratchet_init v2: malformed key material", self.name)
+            return False
+        if len(root_confirm) != 32:
+            logger.warning("[%s] dropped ratchet_init v2: invalid root confirmation MAC length", self.name)
+            return False
+
+        expected_session_id = hermes_ratchet.derive_session_id(
+            uid=self._relay_uid,
+            client_id=self._relay_client_id,
+            agent_ratchet_public_key_base64=responder_pub,
+            peer_ratchet_public_key_base64=initiator_pub,
+        )
+        if str(authed.get("sessionID") or "") != expected_session_id:
+            logger.warning("[%s] dropped ratchet_init v2: sessionID mismatch", self.name)
+            return False
+        initiator_device = hermes_ratchet.derive_device_id(initiator_pub)
+        responder_device = hermes_ratchet.derive_device_id(responder_pub)
+        if (
+            str(authed.get("initiatorDeviceID") or "") != initiator_device
+            or str(authed.get("responderDeviceID") or "") != responder_device
+        ):
+            logger.warning("[%s] dropped ratchet_init v2: device id mismatch", self.name)
+            return False
+
+        transcript = hermes_ratchet.ratchet_init_v2_transcript(
+            uid=self._relay_uid,
+            client_id=self._relay_client_id,
+            destination_id=destination_id,
+            session_id=expected_session_id,
+            initiator_ratchet_public_key_base64=initiator_pub,
+            responder_ratchet_public_key_base64=responder_pub,
+            initiator_device_id=initiator_device,
+            responder_device_id=responder_device,
+            responder_kem_public_key_base64=responder_kem_pub,
+            responder_kem_key_id=responder_kem_key_id,
+            kem_ciphertext_base64=kem_ciphertext_b64,
+            replay_counter=replay_counter,
+        )
+        try:
+            kem_shared = relay_e2ee_v5.xwing_decapsulate(local_kem, kem_ciphertext)
+            root_key = hermes_ratchet.derive_ratchet_init_v2_root(kem_shared, transcript)
+            hermes_ratchet.verify_ratchet_init_v2_root_confirm_mac(
+                root_key=root_key,
+                transcript=transcript,
+                mac=root_confirm,
+            )
+        except (hermes_ratchet.HermesRatchetError, relay_e2ee.RelayCryptoError):
+            logger.warning("[%s] dropped ratchet_init v2: KEM root confirmation failed", self.name)
+            return False
+        if not any(root_key):
+            logger.warning("[%s] dropped ratchet_init v2: root key is all zero", self.name)
+            return False
+
+        existing = self._ratchet_session(destination_id)
+        if existing is not None:
+            if existing.session_id == expected_session_id:
+                return True
+            logger.warning("[%s] dropped ratchet_init v2: refusing to replace active ratchet session", self.name)
+            return False
+        if self._ratchet_session_was_established(expected_session_id):
+            logger.warning(
+                "[%s] dropped ratchet_init v2: session lineage exists but session state is missing",
+                self.name,
+            )
+            return False
+
+        try:
+            session = hermes_ratchet.responder_state(
+                session_id=expected_session_id,
+                local_device_id=responder_device,
+                remote_device_id=initiator_device,
+                shared_secret=root_key,
+                local_initial_ratchet_key_pair=local_pair,
+            )
+        except hermes_ratchet.HermesRatchetError:
+            logger.warning("[%s] dropped ratchet_init v2: could not create responder session", self.name, exc_info=True)
+            return False
+        next_kem = relay_e2ee_v5.generate_kem_private_key()
+        if not self._commit_ratchet_init_v2_session(destination_id, session, next_kem):
+            return False
+        try:
+            self._mark_ratchet_session_established(expected_session_id)
+        except Exception:
+            logger.warning("[%s] could not mark ratchet lineage; rolling back v2 session", self.name, exc_info=True)
+            self._ratchet_sessions.pop(destination_id, None)
+            self._save_ratchet_sessions()
+            return False
+        logger.info("[%s] established v5-signed ratchet session for %s", self.name, destination_id)
+        return True
+
     def _handle_sealed_key_rotation(self, authed: dict) -> bool:
         """Apply an authenticated peer key-rotation event (sign-the-successor).
 
@@ -2758,11 +3549,14 @@ class BurnBarAdapter(BasePlatformAdapter):
         if destination_id:
             self._peer_public_keys[destination_id] = new_enc_b64
         self._peer_relay_key_epoch = new_epoch
-        # A new pinned peer key starts a fresh ratchet session lineage; drop the
-        # cached AND persisted session so the next message re-bootstraps against the
-        # new key (and a crash before then cannot resurrect the stale session).
+        # A new pinned peer key retires the destination's ratchet state. The next
+        # ratchet session must come from a fresh v4-signed ratchet_init; no
+        # deterministic rebootstrap is available.
         self._load_ratchet_sessions()
-        if self._ratchet_sessions.pop(destination_id, None) is not None:
+        retired = self._ratchet_sessions.pop(destination_id, None)
+        if retired is not None:
+            self._e2ee_state.clear_ratchet_lineage(str(retired.session_id))
+            self._e2ee_state.clear_ratchet_receive(str(retired.session_id))
             self._save_ratchet_sessions()
         logger.info(
             "[%s] applied authenticated peer key rotation -> epoch %d",
@@ -3129,6 +3923,7 @@ def interactive_setup() -> None:
     # key is persisted to ~/.hermes/.env by relay_e2ee; only ciphertext leaves.
     agent_relay_public_key = ""
     agent_relay_signing_key = ""
+    agent_relay_kem_public_key = ""
     if RELAY_CRYPTO_AVAILABLE:
         try:
             # persist= wires the freshly minted private key to ~/.hermes/.env (0600,
@@ -3152,6 +3947,14 @@ def interactive_setup() -> None:
         except Exception:
             logger.debug("Could not prepare BurnBar signing identity for pairing", exc_info=True)
             agent_relay_signing_key = ""
+        try:
+            kem_identity = relay_e2ee_v5.AgentKemIdentity.load_or_create(
+                env_var=relay_e2ee_v5.RELAY_KEM_PRIVATE_KEY_ENV, persist=None
+            )
+            agent_relay_kem_public_key = kem_identity.public_key_base64
+        except Exception:
+            logger.debug("Could not prepare BurnBar v5 KEM identity for pairing", exc_info=True)
+            agent_relay_kem_public_key = ""
 
     device_secret = secrets.token_urlsafe(32)
     payload: Dict[str, Any] = {
@@ -3160,14 +3963,22 @@ def interactive_setup() -> None:
         "scopes": ["hermes.gateway.read", "hermes.gateway.write", "hermes.gateway.manage"],
     }
     if agent_relay_public_key:
-        preferred_gateway_relay_version = _preferred_gateway_relay_version()
+        preferred_gateway_relay_version = _preferred_gateway_relay_version_for(agent_relay_kem_public_key)
         payload["agentRelayPublicKey"] = agent_relay_public_key
         payload["relayKeyVersion"] = RELAY_KEY_VERSION
         payload["relayEncryption"] = RELAY_ENCRYPTION
         payload["gatewayRelayKeyVersion"] = preferred_gateway_relay_version
         payload["gatewayRelayEncryption"] = _gateway_relay_encryption_for(preferred_gateway_relay_version)
-        payload["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions()
-        payload.update(_gateway_relay_capability_payload())
+        payload["supportedGatewayRelayKeyVersions"] = _supported_gateway_relay_versions_for(agent_relay_kem_public_key)
+        ratchet_kem_pub, ratchet_kem_key_id = _ratchet_init_kem_key_for_advertisement()
+        payload.update(
+            _gateway_relay_capability_payload(
+                _ratchet_init_public_key_for_advertisement(),
+                agent_relay_kem_public_key,
+                ratchet_kem_pub,
+                ratchet_kem_key_id,
+            )
+        )
         if agent_relay_signing_key:
             payload["agentRelaySigningKey"] = agent_relay_signing_key
     try:
@@ -3220,6 +4031,13 @@ def interactive_setup() -> None:
         or client_payload.get("relaySigningKey")
         or ""
     )
+    peer_relay_kem_key = (
+        approved.get("phoneRelayKemPublicKey")
+        or approved.get("relayKemPublicKey")
+        or client_payload.get("phoneRelayKemPublicKey")
+        or client_payload.get("relayKemPublicKey")
+        or ""
+    )
     # Validate the peer signing key: a present-but-INVALID key must not keep the
     # link v4-pinned (the safety code would then fall back to the two-key form that
     # omits signing, so the human would confirm a code that doesn't bind the key
@@ -3233,9 +4051,20 @@ def interactive_setup() -> None:
                 "for this link (the safety code will bind the encryption keys only)."
             )
             peer_relay_signing_key = ""
+    if peer_relay_kem_key and RELAY_CRYPTO_AVAILABLE and relay_e2ee_v5 is not None:
+        try:
+            relay_e2ee_v5.RelayKemPublicKey.from_base64(str(peer_relay_kem_key))
+        except Exception:
+            print_warning(
+                "BurnBar sent an invalid v5 KEM key; falling back to the v4 wrap "
+                "for this link (the safety code will omit the PQ key)."
+            )
+            peer_relay_kem_key = ""
+    if not peer_relay_kem_key and peer_relay_key_version == GATEWAY_RELAY_KEY_VERSION_V5:
+        peer_relay_key_version = GATEWAY_RELAY_KEY_VERSION_V4
     # v4 needs the peer's pinned signing key; without it floor the persisted version
     # to v3 so the link never tries to emit a v4 wrap it cannot sign-verify.
-    if not peer_relay_signing_key and peer_relay_key_version == GATEWAY_RELAY_KEY_VERSION_V4:
+    if not peer_relay_signing_key and peer_relay_key_version >= GATEWAY_RELAY_KEY_VERSION_V4:
         peer_relay_key_version = GATEWAY_RELAY_KEY_VERSION_V3
     client_id = approved.get("clientId") or client_payload.get("id")
     uid = approved.get("uid") or approved.get("userId")
@@ -3256,7 +4085,22 @@ def interactive_setup() -> None:
         # keys are present, so a relay cannot substitute the new signing key while
         # the human-compared code still matches; otherwise the two-key code.
         safety_code = ""
-        if agent_relay_signing_key and peer_relay_signing_key:
+        if (
+            agent_relay_signing_key
+            and peer_relay_signing_key
+            and agent_relay_kem_public_key
+            and peer_relay_kem_key
+            and peer_relay_key_version == GATEWAY_RELAY_KEY_VERSION_V5
+        ):
+            safety_code = _relay_safety_code_v5(
+                agent_relay_public_key,
+                str(peer_relay_public_key),
+                agent_relay_signing_key,
+                str(peer_relay_signing_key),
+                agent_relay_kem_public_key,
+                str(peer_relay_kem_key),
+            )
+        if not safety_code and agent_relay_signing_key and peer_relay_signing_key:
             safety_code = _relay_safety_code_v4(
                 agent_relay_public_key, str(peer_relay_public_key),
                 agent_relay_signing_key, str(peer_relay_signing_key),
@@ -3308,6 +4152,17 @@ def interactive_setup() -> None:
         save_env_value(RELAY_PEER_KEY_VERSION_ENV, str(peer_relay_key_version))
         if peer_relay_signing_key:
             save_env_value(RELAY_PEER_SIGNING_KEY_ENV, str(peer_relay_signing_key))
+        if peer_relay_kem_key:
+            save_env_value(RELAY_PEER_KEM_KEY_ENV, str(peer_relay_kem_key))
+        if agent_relay_kem_public_key and RELAY_CRYPTO_AVAILABLE and relay_e2ee_v5 is not None:
+            try:
+                kem_identity = relay_e2ee_v5.AgentKemIdentity.load_or_create(
+                    env_var=relay_e2ee_v5.RELAY_KEM_PRIVATE_KEY_ENV,
+                    persist=None,
+                )
+                save_env_value(relay_e2ee_v5.RELAY_KEM_PRIVATE_KEY_ENV, kem_identity.private_key.raw_base64())
+            except Exception:
+                logger.debug("Could not persist BurnBar v5 KEM identity after pairing", exc_info=True)
         save_env_value("BURNBAR_RELAY_CLIENT_ID", str(client_id))
         save_env_value("BURNBAR_RELAY_UID", str(uid))
         print_success("End-to-end encryption is enabled for this BurnBar link.")

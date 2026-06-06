@@ -1,0 +1,30 @@
+{
+  "agentRatchetInitKeyPair": {
+    "privateKeyBase64": "EjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjQ=",
+    "publicKeyBase64": "BFrAuO4J5ldnu2x9NEC74Vy5EtSv4QtuGhf/oezR8uVJl7Q01lg9SplrrmhgYwyz1R3X1Bz9FkzOfi9m/n4RqRQ="
+  },
+  "clientId": "client-v4",
+  "destinationId": "burnbar:home",
+  "expectedPayload": {
+    "algorithm": "OpenBurnBar-HermesRatchet-v1-P256-HKDFSHA256-AESGCM",
+    "clientId": "client-v4",
+    "destinationId": "burnbar:home",
+    "initiatorDeviceID": "d798dc2a422032c6c091aa3d23d58d30",
+    "initiatorRatchetPublicKeyBase64": "BPeIhZ0WPv5oIQrPhzXg5vzfYMt0zeYcqziHWtxnveEsDRNcTla8MX/8tTXJf6JBb7pu6x4Qys+qTOQmNesciWM=",
+    "kind": "ratchet_init",
+    "ratchetInitVersion": 1,
+    "replayCounter": 1,
+    "responderDeviceID": "5e22f5d19cc5c6152fe25ce445e791c3",
+    "responderRatchetPublicKeyBase64": "BFrAuO4J5ldnu2x9NEC74Vy5EtSv4QtuGhf/oezR8uVJl7Q01lg9SplrrmhgYwyz1R3X1Bz9FkzOfi9m/n4RqRQ=",
+    "rootKeyBase64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "sessionID": "46736e1eb8fb10454e04b8fbb093e8ad8bd783ae1e2acf6c46f533ec67c613a3",
+    "uid": "uid-v4"
+  },
+  "name": "HermesGatewayRatchetInitV1",
+  "phoneRatchetInitKeyPair": {
+    "privateKeyBase64": "IjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjQ=",
+    "publicKeyBase64": "BPeIhZ0WPv5oIQrPhzXg5vzfYMt0zeYcqziHWtxnveEsDRNcTla8MX/8tTXJf6JBb7pu6x4Qys+qTOQmNesciWM="
+  },
+  "rootKeyBase64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "uid": "uid-v4"
+}

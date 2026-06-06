@@ -72,6 +72,8 @@ _X963_PUBLIC_KEY_BYTE_COUNT = relay_e2ee._X963_PUBLIC_KEY_BYTE_COUNT  # 65
 PAIRING_TAG_ENCRYPTION = 0x01  # P-256 X9.63 (65B)
 PAIRING_TAG_SIGNING = 0x02     # Ed25519 raw (32B)
 PAIRING_TAG_RATCHET = 0x03     # ratchet identity public (P-256 X9.63 65B)
+PAIRING_TAG_KEM = 0x04         # v5 hybrid ML-KEM-768/X25519 public (1216B)
+PAIRING_TAG_PQ_SIGNING = 0x05  # reserved for future hybrid/PQ signature pubkey
 
 
 class RelayV4SignatureError(relay_e2ee.RelayCryptoError):

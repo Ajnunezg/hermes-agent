@@ -26,12 +26,13 @@ fail closed against a relay that forces large gaps.
 
 **Session bootstrap (provenance of the initial shared secret).** This module takes
 the initial 32-byte ``shared_secret`` as input; it does NOT establish it. The
-integration MUST exchange the initial ratchet public keys and seed the
-``shared_secret`` over an *authenticated* channel — i.e. inside a v4 signed
-envelope (:mod:`gateway.crypto.relay_e2ee_v4`), so the first ratchet public keys
-inherit the pairing safety-code pin. A ``shared_secret`` learned from a
-relay-controlled payload would let the relay seed the session and defeat the
-ratchet; callers must never fall back to plaintext.
+integration MUST exchange the initial ratchet public keys and seed or derive the
+``shared_secret`` over an *authenticated* channel — v4 signed init
+(:mod:`gateway.crypto.relay_e2ee_v4`) or v5 signed PQ init
+(:mod:`gateway.crypto.relay_e2ee_v5`) — so the first ratchet public keys inherit
+the pairing safety-code pin. A ``shared_secret`` learned from a relay-controlled
+payload would let the relay seed the session and defeat the ratchet; callers must
+never fall back to plaintext.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import hashlib
 import hmac
 import os
 from dataclasses import dataclass, field
@@ -47,6 +49,8 @@ from hashlib import sha256
 
 ALGORITHM = "OpenBurnBar-HermesRatchet-v1-P256-HKDFSHA256-AESGCM"
 VERSION = 1
+RATCHET_INIT_VERSION_V2 = 2
+RATCHET_INIT_ALGORITHM_V2 = "OpenBurnBar-HermesRatchet-v2-XWing-P256-HKDFSHA256-AESGCM"
 # Per-chain skip distance: how far ahead of the expected message number a single
 # header may jump before the sender is rejected.
 DEFAULT_MAX_SKIP = 64
@@ -273,6 +277,28 @@ def generate_key_pair() -> HermesRatchetKeyPair:
     )
 
 
+def key_pair_from_private_base64(private_key_base64: str) -> HermesRatchetKeyPair:
+    """Reconstruct a canonical ratchet keypair from a raw P-256 private scalar."""
+    private_key = _private_key_from_base64(private_key_base64)
+    return HermesRatchetKeyPair(
+        private_key_base64=private_key_base64,
+        public_key_base64=_b64(_public_key_x963(private_key.public_key())),
+    )
+
+
+def validate_key_pair(key_pair: HermesRatchetKeyPair) -> None:
+    """Validate that a wire keypair is canonical and internally consistent."""
+    derived = key_pair_from_private_base64(key_pair.private_key_base64)
+    if not hmac.compare_digest(derived.public_key_base64, key_pair.public_key_base64):
+        raise InvalidPublicKeyError("ratchet public key does not match private key")
+    _public_key_from_base64(key_pair.public_key_base64)
+
+
+def validate_public_key_base64(public_key_base64: str) -> None:
+    """Validate a canonical X9.63 P-256 public key encoded as base64."""
+    _public_key_from_base64(public_key_base64)
+
+
 def random_root_key() -> bytes:
     """Generate the 32-byte initial root key material."""
     return _random_bytes(_SYMMETRIC_KEY_BYTES)
@@ -339,6 +365,9 @@ def responder_state(
 _SESSION_ID_DOMAIN = b"OpenBurnBar-HermesRatchet-v1-session"
 _DEVICE_ID_DOMAIN = b"OpenBurnBar-HermesRatchet-v1-device"
 _BOOTSTRAP_INFO = b"OpenBurnBar-HermesRatchet-v1-root-bootstrap"
+_RATCHET_INIT_V2_TRANSCRIPT_DOMAIN = b"OpenBurnBar-HermesRatchet-v2-init-transcript"
+_RATCHET_INIT_V2_ROOT_INFO = b"OpenBurnBar-HermesRatchet-v2-root-pq"
+_RATCHET_INIT_V2_CONFIRM_LABEL = b"OpenBurnBar-HermesRatchet-v2-root-confirm"
 
 
 def derive_session_id(
@@ -357,6 +386,79 @@ def derive_session_id(
 
 def derive_device_id(ratchet_public_key_base64: str) -> str:
     return sha256(_DEVICE_ID_DOMAIN + b"|" + _b64decode(ratchet_public_key_base64, "ratchetPub")).hexdigest()[:32]
+
+
+def ratchet_init_v2_transcript(
+    *,
+    uid: str,
+    client_id: str,
+    destination_id: str,
+    session_id: str,
+    initiator_ratchet_public_key_base64: str,
+    responder_ratchet_public_key_base64: str,
+    initiator_device_id: str,
+    responder_device_id: str,
+    responder_kem_public_key_base64: str,
+    responder_kem_key_id: str,
+    kem_ciphertext_base64: str,
+    replay_counter: int,
+) -> bytes:
+    """Canonical transcript for ratchet_init v2 root derivation and confirmation."""
+    parts = [
+        b"ratchet_init",
+        str(RATCHET_INIT_VERSION_V2).encode("ascii"),
+        RATCHET_INIT_ALGORITHM_V2.encode("utf-8"),
+        str(uid).encode("utf-8"),
+        str(client_id).encode("utf-8"),
+        str(destination_id).encode("utf-8"),
+        str(session_id).encode("ascii"),
+        str(initiator_ratchet_public_key_base64).encode("ascii"),
+        str(responder_ratchet_public_key_base64).encode("ascii"),
+        str(initiator_device_id).encode("ascii"),
+        str(responder_device_id).encode("ascii"),
+        str(responder_kem_public_key_base64).encode("ascii"),
+        str(responder_kem_key_id).encode("ascii"),
+        str(kem_ciphertext_base64).encode("ascii"),
+        int(replay_counter).to_bytes(8, "big"),
+    ]
+    out = bytearray(_RATCHET_INIT_V2_TRANSCRIPT_DOMAIN)
+    for part in parts:
+        _append_part(out, part)
+    return bytes(out)
+
+
+def derive_ratchet_init_v2_root(kem_shared_secret: bytes, transcript: bytes) -> bytes:
+    """Derive the 32-byte initial ratchet root from the PQ KEM secret.
+
+    The transcript hash binds routing ids, both P-256 ratchet keys, both device
+    ids, the responder KEM key id/public key, the KEM ciphertext, and the signed
+    replay counter. A relay cannot move a KEM ciphertext across sessions or keys.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    _validate_symmetric_key(kem_shared_secret, "kemSharedSecret")
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=_SYMMETRIC_KEY_BYTES,
+        salt=b"\x00" * 32,
+        info=_RATCHET_INIT_V2_ROOT_INFO + b"|" + hashlib.sha256(transcript).digest(),
+    ).derive(kem_shared_secret)
+
+
+def ratchet_init_v2_root_confirm_mac(root_key: bytes, transcript: bytes) -> bytes:
+    _validate_symmetric_key(root_key, "rootKey")
+    return hmac.new(root_key, _RATCHET_INIT_V2_CONFIRM_LABEL + transcript, sha256).digest()
+
+
+def verify_ratchet_init_v2_root_confirm_mac(
+    *,
+    root_key: bytes,
+    transcript: bytes,
+    mac: bytes,
+) -> None:
+    if not hmac.compare_digest(ratchet_init_v2_root_confirm_mac(root_key, transcript), mac):
+        raise AuthenticationFailedError("ratchet_init v2 root confirmation failed")
 
 
 def bootstrap_session(
@@ -794,6 +896,8 @@ def _optional_str(value: object) -> str | None:
 __all__ = [
     "ALGORITHM",
     "VERSION",
+    "RATCHET_INIT_VERSION_V2",
+    "RATCHET_INIT_ALGORITHM_V2",
     "DEFAULT_MAX_SKIP",
     "DEFAULT_MAX_SKIPPED_KEYS",
     "HermesRatchetError",
@@ -814,12 +918,19 @@ __all__ = [
     "HermesRatchetEnvelope",
     "HermesRatchetSessionState",
     "generate_key_pair",
+    "key_pair_from_private_base64",
+    "validate_key_pair",
+    "validate_public_key_base64",
     "random_root_key",
     "initiator_state",
     "responder_state",
     "bootstrap_session",
     "derive_session_id",
     "derive_device_id",
+    "ratchet_init_v2_transcript",
+    "derive_ratchet_init_v2_root",
+    "ratchet_init_v2_root_confirm_mac",
+    "verify_ratchet_init_v2_root_confirm_mac",
     "encrypt",
     "decrypt",
     "envelope_aad",
