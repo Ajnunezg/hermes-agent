@@ -154,6 +154,16 @@ _OPENABLE_GATEWAY_RELAY_VERSIONS = (
 # support that wrap; absent/unknown stays v2. Never read from the untrusted relay
 # runtime path (mirrors the _absorb_relay_state policy).
 RELAY_PEER_KEY_VERSION_ENV = "BURNBAR_RELAY_PEER_KEY_VERSION"
+# The peer's authenticated, pairing-pinned set of signed-attachment wrap versions
+# its attachment-OPEN path can handle (comma list, e.g. "4,5"). Only v4/v5 are
+# meaningful (v2/v3 is the legacy unsigned body-key wrap). Absent/garbage => the
+# peer cannot open a signed attachment wrap, so emission keeps the legacy wrap.
+# Never read from the untrusted relay runtime path (mirrors the peer-key policy).
+RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV = "BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS"
+# Operator escape-hatch: opt into a CLASSICAL file-body wrap on a v5-pinned link
+# during migration (e.g. before the phone ships v5 signed-attachment open). Off by
+# default so a v5 link fails closed rather than silently shipping a non-PQ body.
+ATTACHMENT_ALLOW_CLASSICAL_ENV = "BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS"
 # The peer's pinned Ed25519 signing key (base64 raw 32B), authenticated at pairing
 # and bound into the safety code. Required to emit/open v4. Never wire-supplied.
 RELAY_PEER_SIGNING_KEY_ENV = "BURNBAR_RELAY_PEER_SIGNING_KEY"
@@ -576,6 +586,16 @@ def _gateway_relay_capability_payload(
     }
     if agent_relay_kem_public_key and GATEWAY_RELAY_KEY_VERSION_V5 in supported:
         payload["agentRelayKemPublicKey"] = agent_relay_kem_public_key
+    # Signed-attachment wrap support: which v4/v5 versions a peer may use to wrap a
+    # file body-key TO this agent. Advertised so the body-key wrap can inherit the
+    # link's pin (closing the classical file-body gap) without bricking peers that
+    # have not shipped signed-attachment open.
+    attachment_wraps = [
+        v for v in supported
+        if v in (GATEWAY_RELAY_KEY_VERSION_V4, GATEWAY_RELAY_KEY_VERSION_V5)
+    ]
+    payload["supportsGatewayAttachmentWrapVersions"] = attachment_wraps
+    payload["supportsSignedAttachmentWrap"] = bool(attachment_wraps)
     if (
         RELAY_CRYPTO_AVAILABLE
         and hermes_ratchet is not None
@@ -788,6 +808,23 @@ def _coerce_peer_relay_key_version_floor(value: Any) -> int:
     if counter == GATEWAY_RELAY_KEY_VERSION_V3 and _gateway_hpke_v3_enabled():
         return GATEWAY_RELAY_KEY_VERSION_V3
     return GATEWAY_RELAY_KEY_VERSION
+
+
+def _coerce_attachment_wrap_versions(value: Any) -> "set[int]":
+    """Parse the peer's authenticated signed-attachment-open capability.
+
+    Accepts a comma list (e.g. "4,5"). Only v4/v5 are meaningful — v2/v3 is the
+    legacy unsigned body-key wrap, always available. An absent/garbage value yields
+    an empty set, i.e. "the peer cannot open a signed attachment wrap", so emission
+    keeps the legacy wrap and a v5 link fails closed (no silent classical body)."""
+    if not isinstance(value, str):
+        return set()
+    out: "set[int]" = set()
+    for part in value.replace(" ", "").split(","):
+        parsed = _coerce_replay_counter(part)
+        if parsed in (GATEWAY_RELAY_KEY_VERSION_V4, GATEWAY_RELAY_KEY_VERSION_V5):
+            out.add(parsed)
+    return out
 
 
 def _peer_relay_key_version_from_pairing_grant(approved: dict, client_payload: dict) -> int:
@@ -1497,11 +1534,13 @@ class _RelaySealer:
                 return self._seal_ratchet(
                     destination_id=destination_id, payload_plaintext=payload_bytes, message_id=message_id
                 )
+        # Fail closed if this link cannot emit at its pinned floor (e.g. a v5 pin
+        # whose local KEM is unavailable) BEFORE reserving a counter or sealing.
+        peer_version = self._adapter._emit_version_or_refuse(destination_id)
         self._adapter._inject_outbound_replay_counter(destination_id, payload)
         payload_bytes = json.dumps(payload).encode("utf-8")
         message_aad = _gateway_message_aad(self._uid, self._client_id, message_id)
         key_aad = _gateway_message_key_aad(self._uid, self._client_id, message_id)
-        peer_version = self._adapter._peer_relay_key_version_for(destination_id)
         if peer_version == GATEWAY_RELAY_KEY_VERSION_V5:
             peer_kem = self._adapter._peer_kem_public_for(destination_id)
             if not peer_kem:
@@ -1537,9 +1576,12 @@ class _RelaySealer:
         attachment_id = secrets.token_hex(16)
         data = file_path.read_bytes()
         body_key = relay_e2ee.generate_symmetric_key()
-        sealed_body_b64 = relay_e2ee.seal_to_base64(
-            data, body_key, _gateway_attachment_body_aad(self._uid, self._client_id, attachment_id)
-        )
+        body_aad = _gateway_attachment_body_aad(self._uid, self._client_id, attachment_id)
+        manifest_aad = _gateway_attachment_manifest_aad(self._uid, self._client_id, attachment_id)
+        key_aad = _gateway_attachment_key_aad(self._uid, self._client_id, attachment_id)
+        # The large file BODY is unchanged: AES-256-GCM under body_key + the body AAD
+        # (already post-quantum safe — only the body-KEY transport could leak).
+        sealed_body_b64 = relay_e2ee.seal_to_base64(data, body_key, body_aad)
         body_bytes = sealed_body_b64.encode("ascii")
         manifest_payload: Dict[str, Any] = {
             "fileName": file_path.name,
@@ -1548,20 +1590,41 @@ class _RelaySealer:
             "destinationId": destination_id,
         }
         self._adapter._inject_outbound_replay_counter(destination_id, manifest_payload)
+        # Choose the body-KEY transport version. On a v5 pin this fails closed rather
+        # than silently shipping a classical body-key wrap (Finding B).
+        version = self._adapter._emit_attachment_wrap_version_or_refuse(destination_id)
+        if version in (GATEWAY_RELAY_KEY_VERSION_V5, GATEWAY_RELAY_KEY_VERSION_V4):
+            # Signed lane: carry the body key INSIDE the signed manifest, whose own
+            # content key is wrapped at the pinned version (hybrid ML-KEM at v5). The
+            # body key — and thus the file — inherits the link's PQ confidentiality,
+            # and one Ed25519 signature authenticates the manifest AND the body-key
+            # wrap together. The body stays sealed under its own distinct AAD/key.
+            manifest_payload["bodyKeyBase64"] = base64.b64encode(body_key).decode("ascii")
+            manifest = json.dumps(manifest_payload).encode("utf-8")
+            if version == GATEWAY_RELAY_KEY_VERSION_V5:
+                peer_kem = self._adapter._peer_kem_public_for(destination_id)
+                if not peer_kem:
+                    raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange files"))
+                fields = self._seal_signed_v5(
+                    peer_kem=peer_kem, destination_id=destination_id,
+                    payload_plaintext=manifest, key_aad=key_aad, payload_aad=manifest_aad,
+                )
+            else:
+                fields = self._seal_signed_v4(
+                    peer=peer, sender_private=sender_private, destination_id=destination_id,
+                    payload_plaintext=manifest, key_aad=key_aad, payload_aad=manifest_aad,
+                )
+            return {**fields, "attachmentId": attachment_id}, body_bytes
+        # Legacy v2/v3 lane: byte-identical to the prior behavior. The manifest is
+        # sealed with the body key under a DISTINCT AAD from the body (a relay cannot
+        # swap manifest/body slots — the AAD mismatch fails the tag), and the body
+        # key is wrapped v2/v3.
         manifest = json.dumps(manifest_payload).encode("utf-8")
-        # The manifest payload is sealed with the same body key BUT under a
-        # DISTINCT AAD label (gatewayAttachmentManifest) from the body
-        # (gatewayAttachmentBody). The phone unwraps the body key once and opens
-        # both, each bound to its own AAD — so a relay cannot swap the manifest
-        # ciphertext into the body slot (or vice-versa): the AAD mismatch fails
-        # the tag.
-        manifest_ct = relay_e2ee.seal_to_base64(
-            manifest, body_key, _gateway_attachment_manifest_aad(self._uid, self._client_id, attachment_id)
-        )
+        manifest_ct = relay_e2ee.seal_to_base64(manifest, body_key, manifest_aad)
         fields = self._wrap_content_key(
             peer=peer,
             key_data=body_key,
-            key_aad=_gateway_attachment_key_aad(self._uid, self._client_id, attachment_id),
+            key_aad=key_aad,
             sender_private=sender_private,
             destination_id=destination_id,
         )
@@ -1666,9 +1729,9 @@ class _RelaySealer:
             "modelId": model_id,
             "destinationId": destination_id,
         }
+        peer_version = self._adapter._emit_version_or_refuse(destination_id)
         self._adapter._inject_outbound_replay_counter(destination_id, payload)
         payload_bytes = json.dumps(payload).encode("utf-8")
-        peer_version = self._adapter._peer_relay_key_version_for(destination_id)
         if peer_version == GATEWAY_RELAY_KEY_VERSION_V5:
             peer_kem = self._adapter._peer_kem_public_for(destination_id)
             if not peer_kem:
@@ -1926,6 +1989,14 @@ class BurnBarAdapter(BasePlatformAdapter):
         # Reserved for future multi-link pairing; today no flow populates it, so
         # every link resolves to ``_peer_relay_key_version_default`` below.
         self._peer_relay_key_versions: Dict[str, int] = {}
+        # The peer's authenticated set of signed-attachment wrap versions it can
+        # OPEN (v4/v5). Empty => keep the legacy v2/v3 body-key wrap. Drives the
+        # attachment send guard so a file body-key inherits the link's pin without
+        # bricking a peer that has not shipped signed-attachment open.
+        self._peer_attachment_wrap_versions_default: "set[int]" = _coerce_attachment_wrap_versions(
+            os.getenv(RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV)
+        )
+        self._peer_attachment_wrap_versions: Dict[str, "set[int]"] = {}
         # --- v4 hardening identities (lazily loaded; see _ensure_relay_identity) ---
         # The agent's own Ed25519 signing identity (separate from the P-256 relay
         # key), and the peer's pinned Ed25519 verification key (authenticated at
@@ -2274,10 +2345,14 @@ class BurnBarAdapter(BasePlatformAdapter):
         return None
 
     def _ratchet_init_public_key_for_advertisement(self) -> Optional[str]:
+        if _gateway_ratchet_disabled():
+            return None
         key_pair = self._ensure_ratchet_init_key_pair()
         return key_pair.public_key_base64 if key_pair is not None else None
 
     def _ratchet_init_kem_key_for_advertisement(self) -> tuple[Optional[str], Optional[str]]:
+        if _gateway_ratchet_disabled():
+            return None, None
         key_pair = self._ensure_ratchet_init_kem_key_pair()
         if key_pair is None:
             return None, None
@@ -2771,6 +2846,83 @@ class BurnBarAdapter(BasePlatformAdapter):
         if version is None:
             return self._peer_relay_key_version_floor_default
         return _coerce_peer_relay_key_version_floor(version)
+
+    def _emit_version_or_refuse(self, destination_id: str) -> int:
+        """Resolve the wrap version to EMIT, failing closed on a silent PQ downgrade.
+
+        The send path must protect the one property a downgrade can leak to the
+        untrusted relay irreversibly: post-quantum CONFIDENTIALITY of the bytes it
+        records (harvest-now-decrypt-later). A v5-pinned link whose local KEM is
+        unavailable resolves emission down to the classical v4 wrap
+        (:meth:`_peer_relay_key_version_for`); silently putting that v4 ciphertext
+        on the wire hands the relay a non-PQ copy and defeats the v5 pin. So when
+        the inbound floor is v5 but emission would be classical (< v5), refuse and
+        surface it instead of degrading in silence.
+
+        This is deliberately scoped to the PQ boundary. The v4->v3 and v3->v2
+        emission fallbacks (a missing pinned peer signing key, a v3 break-glass)
+        only trade AUTH strength between two already-classical wraps — they do not
+        change the confidentiality of recorded ciphertext — and remain the existing
+        accepted behaviour. The explicit v5 break-glass flag lowers the floor to v4
+        in BOTH directions, so a deliberate rollback stays allowed."""
+        version = self._peer_relay_key_version_for(destination_id)
+        floor = self._peer_relay_key_version_floor_for(destination_id)
+        if floor >= GATEWAY_RELAY_KEY_VERSION_V5 and version < GATEWAY_RELAY_KEY_VERSION_V5:
+            raise _RelayPlaintextRefused(
+                f"refusing a silent post-quantum downgrade: this link is pinned to "
+                f"v{floor} (hybrid KEM) but can only emit classical v{version} right "
+                f"now (e.g. the local v5 KEM identity could not be loaded). Restore "
+                f"the relay KEM identity, or set {GATEWAY_HPKE_V5_DISABLED_ENV}=1 for "
+                f"an explicit, auditable break-glass rollback to v4."
+            )
+        return version
+
+    def _peer_attachment_wrap_versions_for(self, destination_id: str) -> "set[int]":
+        override = self._peer_attachment_wrap_versions.get(str(destination_id or ""))
+        if override is not None:
+            return override
+        return self._peer_attachment_wrap_versions_default
+
+    def _emit_attachment_wrap_version_or_refuse(self, destination_id: str) -> int:
+        """Resolve the attachment body-key wrap version, symmetric with the message
+        PQ floor guard (:meth:`_emit_version_or_refuse`).
+
+        Returns v5 / v4 to seal the manifest (carrying the body key) on the signed
+        lane, or the v2 sentinel meaning "use the legacy unsigned body-key wrap".
+        The peer must have ADVERTISED that its attachment-open path can handle the
+        version (``_peer_attachment_wrap_versions_for``), so upgrading never bricks a
+        phone that has not shipped signed-attachment open.
+
+        STOPGAP: on a v5 (PQ) pin, if a v5 attachment wrap cannot be emitted (the
+        peer is not yet v5-attachment capable, or the local KEM is unavailable), the
+        file body the relay records would fall back to a classical wrap — so FAIL
+        CLOSED rather than leak it silently. An operator who accepts the classical
+        file-body risk during migration opts in with
+        ``BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS=1``."""
+        pin = self._peer_relay_key_version_for(destination_id)
+        floor = self._peer_relay_key_version_floor_for(destination_id)
+        caps = self._peer_attachment_wrap_versions_for(destination_id)
+        candidates = [
+            v for v in (GATEWAY_RELAY_KEY_VERSION_V5, GATEWAY_RELAY_KEY_VERSION_V4)
+            if v <= pin and v in caps
+        ]
+        emit = candidates[0] if candidates else GATEWAY_RELAY_KEY_VERSION  # v2 = legacy wrap
+        if floor >= GATEWAY_RELAY_KEY_VERSION_V5 and emit < GATEWAY_RELAY_KEY_VERSION_V5:
+            if (os.getenv(ATTACHMENT_ALLOW_CLASSICAL_ENV) or "").strip() == "1":
+                logger.warning(
+                    "[%s] %s=1: sending a CLASSICAL file-body wrap on a v5-pinned link",
+                    self.name, ATTACHMENT_ALLOW_CLASSICAL_ENV,
+                )
+                return emit
+            raise _RelayPlaintextRefused(
+                f"refusing a silent post-quantum downgrade of a file body: this link is "
+                f"pinned to v{floor} (hybrid KEM) but cannot emit a v5 attachment wrap "
+                f"(the peer has not advertised v5 signed-attachment support, or the local "
+                f"KEM is unavailable). Upgrade the peer's attachment-open support, restore "
+                f"the relay KEM identity, or set {ATTACHMENT_ALLOW_CLASSICAL_ENV}=1 to opt "
+                f"into classical file-body wraps during migration."
+            )
+        return emit
 
     async def connect(self) -> bool:
         if not HTTPX_AVAILABLE:
@@ -3337,6 +3489,18 @@ class BurnBarAdapter(BasePlatformAdapter):
         existing = self._ratchet_session(destination_id)
         if existing is not None:
             if existing.session_id == expected_session_id:
+                # Self-heal a crash-orphaned session: if the durable session was
+                # committed but the separate lineage write never landed (power loss
+                # between the two), re-mark it. Safe here because this branch is
+                # reached only after the init fully re-authenticated (signed lane +
+                # the replay-counter gate), so no unauthenticated party can trigger
+                # it. Without this, the orphan stays permanently unusable.
+                if not self._ratchet_session_was_established(expected_session_id):
+                    try:
+                        self._mark_ratchet_session_established(expected_session_id)
+                    except Exception:
+                        logger.warning("[%s] could not re-mark ratchet lineage", self.name, exc_info=True)
+                        return False
                 return True
             logger.warning("[%s] dropped ratchet_init: refusing to replace active ratchet session", self.name)
             return False
@@ -3472,6 +3636,16 @@ class BurnBarAdapter(BasePlatformAdapter):
         existing = self._ratchet_session(destination_id)
         if existing is not None:
             if existing.session_id == expected_session_id:
+                # Self-heal a crash-orphaned session (durable session committed but
+                # the separate lineage write never landed). Reached only after the
+                # v5-signed init re-authenticated + the KEM root-confirm MAC passed,
+                # so re-marking is safe. Without this, the orphan stays unusable.
+                if not self._ratchet_session_was_established(expected_session_id):
+                    try:
+                        self._mark_ratchet_session_established(expected_session_id)
+                    except Exception:
+                        logger.warning("[%s] could not re-mark ratchet lineage v2", self.name, exc_info=True)
+                        return False
                 return True
             logger.warning("[%s] dropped ratchet_init v2: refusing to replace active ratchet session", self.name)
             return False
