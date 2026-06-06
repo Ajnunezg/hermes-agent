@@ -264,6 +264,7 @@ def test_register_shape_matches_platform_registry():
 def _legacy_adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
     return BurnBarAdapter(cfg)
@@ -435,16 +436,20 @@ def test_runtime_status_payload_shape(monkeypatch):
 # ---------------------------------------------------------------------------
 # E2E relay (PR2): seal -> open round trip, refuse-plaintext
 # ---------------------------------------------------------------------------
-def _e2e_adapter(monkeypatch, tmp_path, *, peer_public_key=None):
+def _e2e_adapter(monkeypatch, tmp_path, *, peer_public_key=None, agent_priv=None):
     """Build an adapter forced into E2E mode with an injected agent identity."""
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
+    if not (tmp_path / "replay.json").exists():
+        (tmp_path / "replay.json").write_text("{}")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     monkeypatch.delenv("BURNBAR_RELAY_PEER_PUBLIC_KEY", raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
     adapter = BurnBarAdapter(cfg)
     # Inject a deterministic agent relay identity (avoid touching ~/.hermes/.env).
-    agent_priv = relay_e2ee.generate_private_key()
+    if agent_priv is None:
+        agent_priv = relay_e2ee.generate_private_key()
     adapter._relay_identity = relay_e2ee.AgentRelayIdentity(agent_priv)
     adapter._relay_e2e_enabled = True
     adapter._relay_uid = "uid-1"
@@ -750,6 +755,7 @@ def _no_persist(monkeypatch):
     import hermes_cli.config as _cfg
 
     monkeypatch.setattr(_cfg, "save_env_value", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(_cfg, "save_env_values", lambda *a, **k: None, raising=False)
 
 
 # --- Finding 1: peer-key pinning (TOFU + reject post-pairing change) --------
@@ -999,16 +1005,27 @@ def test_relay_identity_persists_and_survives_reload(monkeypatch, tmp_path):
 
 
 @requires_relay
-def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
+def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch, tmp_path):
     """Device-poll may return the phone pubkey inside a client view; setup must still persist E2E."""
     saved: dict[str, str] = {}
     phone_public_key = relay_e2ee.generate_private_key().public_key_base64()
     agent_public_key = relay_e2ee.generate_private_key().public_key_base64()
+    agent_signing_public_key = _burnbar.relay_e2ee_v4.generate_signing_key().public_key_base64()
+    e2ee_state_file = tmp_path / "burnbar_e2ee_state.json"
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", e2ee_state_file)
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "burnbar_replay_ledger.json")
     monkeypatch.setattr(_burnbar, "RELAY_CRYPTO_AVAILABLE", True)
     monkeypatch.setattr(
         _burnbar.relay_e2ee.AgentRelayIdentity,
         "load_or_create",
         lambda *args, **kwargs: type("Identity", (), {"public_key_base64": agent_public_key})(),
+    )
+    monkeypatch.setattr(
+        _burnbar.relay_e2ee_v4.AgentSigningIdentity,
+        "load_or_create",
+        lambda *args, **kwargs: type(
+            "SigningIdentity", (), {"public_key_base64": agent_signing_public_key}
+        )(),
     )
     monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda key, value: saved.__setitem__(key, value))
     monkeypatch.setattr("hermes_cli.setup.get_env_value", lambda key: None)
@@ -1058,7 +1075,55 @@ def test_setup_accepts_nested_phone_relay_key_from_poll_response(monkeypatch):
     assert saved["BURNBAR_RELAY_PEER_PUBLIC_KEY"] == phone_public_key
     assert saved["BURNBAR_RELAY_CLIENT_ID"] == "hgw_1"
     assert saved["BURNBAR_RELAY_UID"] == "uid_1"
+    bucket = _burnbar.stable_signed_bucket_id(
+        uid="uid_1",
+        client_id="hgw_1",
+        destination_id="burnbar:home",
+        peer_signing_fingerprint=_burnbar.signing_key_fingerprint(None),
+        local_signing_fingerprint=_burnbar.signing_key_fingerprint(agent_signing_public_key),
+    )
+    state = json.loads(e2ee_state_file.read_text(encoding="utf-8"))
+    assert state["signed"][bucket] == {"inboundHighWater": -1, "outboundNextCounter": 1}
     assert prompt_defaults == [False]
+
+
+@requires_relay
+def test_setup_security_state_initialization_migrates_legacy_high_water(monkeypatch, tmp_path):
+    e2ee_state_file = tmp_path / "burnbar_e2ee_state.json"
+    replay_ledger = tmp_path / "burnbar_replay_ledger.json"
+    replay_ledger.write_text(json.dumps({"legacy-bucket": {"highWater": 12, "ids": []}}), encoding="utf-8")
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", replay_ledger)
+
+    bucket = _burnbar._initialize_pairing_security_state(
+        uid="uid_1",
+        client_id="hgw_1",
+        destination_id="burnbar:home",
+        peer_signing_key_b64=None,
+        local_signing_key_b64=None,
+        state_path=e2ee_state_file,
+    )
+
+    state = json.loads(e2ee_state_file.read_text(encoding="utf-8"))
+    assert state["signed"][bucket] == {"inboundHighWater": 12, "outboundNextCounter": 13}
+
+
+@requires_relay
+def test_setup_security_state_initialization_refuses_corrupt_legacy_ledger(monkeypatch, tmp_path):
+    e2ee_state_file = tmp_path / "burnbar_e2ee_state.json"
+    replay_ledger = tmp_path / "burnbar_replay_ledger.json"
+    replay_ledger.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", replay_ledger)
+
+    with pytest.raises(_burnbar.BurnBarE2EEStateError):
+        _burnbar._initialize_pairing_security_state(
+            uid="uid_1",
+            client_id="hgw_1",
+            destination_id="burnbar:home",
+            peer_signing_key_b64=None,
+            local_signing_key_b64=None,
+            state_path=e2ee_state_file,
+        )
+    assert not e2ee_state_file.exists()
 
 
 @requires_relay
@@ -1263,13 +1328,14 @@ def test_replay_ledger_persists_authenticated_high_water(monkeypatch, tmp_path):
     """Restarted adapters load the sender-counter high-water mark, not just ids."""
     replay_file = tmp_path / "replay.json"
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", replay_file)
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", replay_file.with_name("e2ee.json"))
     phone_priv = relay_e2ee.generate_private_key()
     phone_pub = phone_priv.public_key_base64()
 
-    adapter1, _ = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub)
+    adapter1, agent_priv = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub)
     assert adapter1._record_event("evt-high-water", replay_counter=9) is True
 
-    adapter2, _ = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub)
+    adapter2, _ = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub, agent_priv=agent_priv)
     assert adapter2._event_replay_high_water == 9
     assert adapter2._is_replay_counter_seen(8) is True
     assert adapter2._is_replay_counter_seen(9) is True
@@ -1866,6 +1932,7 @@ async def test_e2e_missing_routing_ids_fails_closed_for_send_and_receive(monkeyp
     _no_persist(monkeypatch)
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
     monkeypatch.setenv(_burnbar.RELAY_E2E_ENV, "1")
     monkeypatch.setenv(_burnbar.RELAY_PRIVATE_KEY_ENV, relay_e2ee.generate_private_key().raw_base64())
     phone_priv = relay_e2ee.generate_private_key()
@@ -1963,6 +2030,7 @@ async def test_mp5_e2e_capable_agent_refuses_inbound_plaintext_without_optin(mon
     """
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
     monkeypatch.setenv("BURNBAR_RELAY_PRIVATE_KEY", relay_e2ee.generate_private_key().raw_base64())
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     monkeypatch.delenv("BURNBAR_ALLOW_PLAINTEXT", raising=False)
@@ -2009,6 +2077,7 @@ async def test_gateway_event_vector_passes_production_open_path(monkeypatch, tmp
 
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     monkeypatch.delenv("BURNBAR_RELAY_PEER_PUBLIC_KEY", raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
@@ -2176,6 +2245,7 @@ def test_replay_ledger_survives_adapter_restart(monkeypatch, tmp_path):
     """Persisted replay ids block redelivery after a new adapter instance."""
     replay_file = tmp_path / "replay.json"
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", replay_file)
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", replay_file.with_name("e2ee.json"))
     adapter1, _ = _e2e_adapter(monkeypatch, tmp_path)
     adapter1._record_event("evt_persisted")
     adapter2, _ = _e2e_adapter(monkeypatch, tmp_path)
@@ -2190,6 +2260,7 @@ async def test_persistent_replay_ledger_blocks_sealed_event_after_restart(monkey
     phone_pub = phone_priv.public_key_base64()
     replay_file = tmp_path / "replay.json"
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", replay_file)
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", replay_file.with_name("e2ee.json"))
 
     adapter1, agent_priv = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub)
     agent_pub = adapter1._relay_public_key_base64()
@@ -2462,6 +2533,57 @@ async def test_relay_top_level_model_switch_spoof_cannot_override_sealed_chat(mo
 
     assert len(received) == 1
     assert received[0].text == "normal chat"
+
+
+@requires_relay
+@pytest.mark.asyncio
+async def test_sealed_json_text_is_not_reparsed_as_control(monkeypatch, tmp_path):
+    """Authenticated chat text that looks like JSON remains chat text, not a command."""
+    phone_priv = relay_e2ee.generate_private_key()
+    phone_pub = phone_priv.public_key_base64()
+    adapter, _agent = _e2e_adapter(monkeypatch, tmp_path, peer_public_key=phone_pub)
+    agent_pub = adapter._relay_public_key_base64()
+    adapter._publish_runtime_status = lambda *a, **k: pytest.fail("model switch side effect should not run")
+
+    event_id = "evt_json_text_not_control"
+    chat_text = '{"kind":"model_switch","modelId":"evil/model"}'
+    sym = relay_e2ee.generate_symmetric_key()
+    payload_ct = relay_e2ee.seal_to_base64(
+        json.dumps(
+            {
+                "text": chat_text,
+                "destinationId": "burnbar:home",
+                "replayCounter": 1,
+            }
+        ).encode(),
+        sym,
+        _burnbar._gateway_event_aad("uid-1", "client-1", event_id),
+    )
+    wrapped = relay_e2ee.wrap_symmetric_key(
+        sym,
+        agent_pub,
+        _burnbar._gateway_event_key_aad("uid-1", "client-1", event_id),
+        sender_private=phone_priv,
+    )
+    received = []
+    adapter.handle_message = lambda e: received.append(e) or _noop()
+
+    await adapter._handle_burnbar_event(
+        {
+            "id": event_id,
+            "destinationId": "burnbar:home",
+            "senderPublicKey": phone_pub,
+            "relayEnvelope": {
+                "payloadCiphertext": payload_ct,
+                "wrappedKey": wrapped,
+                "relayKeyVersion": _burnbar.GATEWAY_RELAY_KEY_VERSION,
+                "senderPublicKey": phone_pub,
+            },
+        }
+    )
+
+    assert len(received) == 1
+    assert received[0].text == chat_text
 
 
 @requires_relay

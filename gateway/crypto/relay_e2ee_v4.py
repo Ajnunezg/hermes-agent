@@ -519,9 +519,9 @@ def padme_unpad(padded: bytes) -> bytes:
     end = _PADME_TRUE_LEN_HEADER + true_len
     if end > len(padded):
         raise relay_e2ee.InvalidCiphertextError("padded buffer declares more content than present")
-    # Canonical-length check: the buffer must be EXACTLY the Padmé length for its
-    # declared content, so the encoding is bijective and a sender cannot overstate
-    # ``true_len`` to absorb trailing zero pad bytes as content.
+    # Canonical-length check: this accepts only the single encoding emitted by
+    # padme_pad for the declared content length. That prevents a sender from
+    # overstating ``true_len`` to absorb trailing zero pad bytes as content.
     if len(padded) != padme_padded_len(end):
         raise relay_e2ee.InvalidCiphertextError("non-canonical padded length")
     if any(b != 0 for b in padded[end:]):

@@ -19,6 +19,7 @@ from hermes_cli.config import (
     remove_env_value,
     save_config,
     save_env_value,
+    save_env_values,
     save_env_value_secure,
     sanitize_env_file,
     _sanitize_env_lines,
@@ -291,6 +292,26 @@ class TestSaveEnvValueSecure:
             save_env_value("TENOR_API_KEY", "sk-test-secret")
             env_mode = (tmp_path / ".env").stat().st_mode & 0o777
             assert env_mode == 0o600
+
+    def test_save_env_values_updates_multiple_keys_atomically(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            os.environ.pop("BURNBAR_RELAY_PEER_PUBLIC_KEY", None)
+            os.environ.pop("BURNBAR_RELAY_PEER_KEY_EPOCH", None)
+            save_env_value("EXISTING_KEY", "keep-me")
+
+            save_env_values(
+                {
+                    "BURNBAR_RELAY_PEER_PUBLIC_KEY": "peer-key",
+                    "BURNBAR_RELAY_PEER_KEY_EPOCH": "7",
+                }
+            )
+
+            env_values = load_env()
+            assert env_values["EXISTING_KEY"] == "keep-me"
+            assert env_values["BURNBAR_RELAY_PEER_PUBLIC_KEY"] == "peer-key"
+            assert env_values["BURNBAR_RELAY_PEER_KEY_EPOCH"] == "7"
+            assert os.environ["BURNBAR_RELAY_PEER_PUBLIC_KEY"] == "peer-key"
+            assert os.environ["BURNBAR_RELAY_PEER_KEY_EPOCH"] == "7"
 
 
 class TestRemoveEnvValue:
