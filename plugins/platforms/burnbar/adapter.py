@@ -55,6 +55,13 @@ except ImportError:  # pragma: no cover - exercised only when cryptography is ab
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from plugins.platforms.burnbar.e2ee_state_store import (
+    BurnBarE2EEStateStore,
+    BurnBarE2EEStateError,
+    DEFAULT_STATE_FILE,
+    stable_signed_bucket_id,
+    signing_key_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -143,13 +150,15 @@ RELAY_PEER_SIGNING_KEY_ENV = "BURNBAR_RELAY_PEER_SIGNING_KEY"
 # (HPKE_V3_DISABLED) or to forbid v4 emission (V4_DISABLED) in an emergency.
 GATEWAY_HPKE_V3_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V3"
 GATEWAY_HPKE_V4_DISABLED_ENV = "BURNBAR_DISABLE_GATEWAY_HPKE_V4"
-# Opt-in: route the CHAT message lane through the Double Ratchet (forward secrecy
-# + post-compromise security) instead of the per-message v4 signed wrap. Requires
-# a v4-negotiated link. Off by default so the conservative v4 signed envelope is
-# the baseline; control events (model_switch, approvals) always use the v4 wrap.
+# Reserved opt-in flag for a future ratchet lane. The deterministic static-static
+# bootstrap is disabled until a v4-signed ratchet-init handshake authenticates the
+# first ratchet public key; the v4 signed envelope remains the production lane.
 RELAY_RATCHET_ENABLED_ENV = "BURNBAR_RELAY_RATCHET"
 RATCHET_SESSION_FILE = Path(
     os.getenv("HERMES_BURNBAR_RATCHET_FILE", "~/.hermes/cache/burnbar_ratchet_sessions.json")
+).expanduser()
+BURNBAR_E2EE_STATE_FILE = Path(
+    os.getenv("HERMES_BURNBAR_E2EE_STATE_FILE", str(DEFAULT_STATE_FILE))
 ).expanduser()
 # Single-source the AAD namespace from relay_e2ee. RelayNamespace.aad(parts)
 # yields the locked wire bytes "OpenBurnBar-HermesRelay-v1|" + "|".join(parts);
@@ -274,23 +283,37 @@ def _is_safe_model_id(model_id: str) -> bool:
     return bool(model_id) and bool(_SAFE_MODEL_ID.fullmatch(model_id))
 
 
-def _coalesce_sealed_control_payload(authed: dict) -> dict:
-    """Merge control-plane fields that may live inside a JSON ``text`` wrapper."""
-    kind = str(authed.get("kind") or "").strip()
-    if kind:
-        return authed
-    text = str(authed.get("text") or "").strip()
-    if not text.startswith("{"):
-        return authed
+def _initialize_pairing_security_state(
+    *,
+    uid: str,
+    client_id: str,
+    destination_id: str,
+    peer_signing_key_b64: str | None,
+    local_signing_key_b64: str | None,
+    state_path: Path | None = None,
+) -> str:
+    """Create the durable replay bucket before enabling a newly paired E2E link."""
+    bucket_id = stable_signed_bucket_id(
+        uid=str(uid),
+        client_id=str(client_id),
+        destination_id=str(destination_id),
+        peer_signing_fingerprint=signing_key_fingerprint(peer_signing_key_b64),
+        local_signing_fingerprint=signing_key_fingerprint(local_signing_key_b64),
+    )
+    resolved_state_path = state_path or BURNBAR_E2EE_STATE_FILE
+    store = BurnBarE2EEStateStore(resolved_state_path)
     try:
-        nested = json.loads(text)
-    except Exception:
-        return authed
-    if not isinstance(nested, dict) or not nested.get("kind"):
-        return authed
-    merged = dict(authed)
-    merged.update(nested)
-    return merged
+        store.load_or_fail_closed(
+            has_e2e_pins=True,
+            ledger_path=REPLAY_LEDGER_FILE,
+            target_bucket_id=bucket_id,
+        )
+    except BurnBarE2EEStateError:
+        if resolved_state_path.is_file() or REPLAY_LEDGER_FILE.is_file():
+            raise
+        pass
+    store.initialize_pairing_bucket(bucket_id)
+    return bucket_id
 
 
 def _api_base(config: PlatformConfig | None = None) -> str:
@@ -1066,12 +1089,12 @@ class _RelaySealer:
         }
 
     def _seal_ratchet(self, *, destination_id: str, payload_plaintext: bytes, message_id: str) -> dict:
-        """Seal a chat payload through the Double Ratchet (forward secrecy + PCS),
-        with Padmé length padding so the relay sees only a size-hidden ciphertext.
+        """Dormant sender for the future v4-signed ratchet-init lane.
 
         The ratchet advance is persisted BEFORE the envelope is returned (fail-
         closed): a message is never put on the wire with a ratchet step that is not
-        yet durable, so a crash cannot reuse a message number."""
+        yet durable, so a crash cannot reuse a message number. Production callers
+        cannot reach this while ``_ratchet_enabled()`` is false."""
         base = self._adapter._ratchet_session(destination_id)
         if base is None:
             raise _RelayPlaintextRefused(self.cannot_seal_reason("exchange messages"))
@@ -1093,9 +1116,9 @@ class _RelaySealer:
             raise _RelayPlaintextRefused(self._adapter._relay_e2e_config_error)
         destination_id = str(raw.get("destinationId") or "")
         if not self._adapter._can_ratchet(destination_id):
-            if self.must_seal:
-                raise _RelayPlaintextRefused(self._inbound_plaintext_refusal_reason("event"))
-            return None
+            raise _RelayPlaintextRefused(
+                "ratchet lane is disabled until v4-signed ratchet initialization is implemented"
+            )
         base = self._adapter._ratchet_session(destination_id)
         if base is None:
             raise _RelayPlaintextRefused(
@@ -1108,6 +1131,13 @@ class _RelaySealer:
             raise _RelayPlaintextRefused(
                 "could not durably persist the ratchet session; refusing to deliver"
             )
+
+        session_id = self._adapter._ratchet_session_id(destination_id)
+        if session_id:
+            self._adapter._e2ee_state.record_ratchet_receive(
+                session_id, session.receive_message_number
+            )
+
         decoded = json.loads(relay_e2ee_v4.padme_unpad(plaintext).decode("utf-8"))
         return decoded if isinstance(decoded, dict) else {"text": str(decoded)}
 
@@ -1148,6 +1178,8 @@ class _RelaySealer:
                 return self._seal_ratchet(
                     destination_id=destination_id, payload_plaintext=payload_bytes, message_id=message_id
                 )
+        self._adapter._inject_outbound_replay_counter(destination_id, payload)
+        payload_bytes = json.dumps(payload).encode("utf-8")
         message_aad = _gateway_message_aad(self._uid, self._client_id, message_id)
         key_aad = _gateway_message_key_aad(self._uid, self._client_id, message_id)
         if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
@@ -1180,14 +1212,14 @@ class _RelaySealer:
             data, body_key, _gateway_attachment_body_aad(self._uid, self._client_id, attachment_id)
         )
         body_bytes = sealed_body_b64.encode("ascii")
-        manifest = json.dumps(
-            {
-                "fileName": file_path.name,
-                "byteCount": len(data),
-                "contentType": content_type,
-                "destinationId": destination_id,
-            }
-        ).encode("utf-8")
+        manifest_payload: Dict[str, Any] = {
+            "fileName": file_path.name,
+            "byteCount": len(data),
+            "contentType": content_type,
+            "destinationId": destination_id,
+        }
+        self._adapter._inject_outbound_replay_counter(destination_id, manifest_payload)
+        manifest = json.dumps(manifest_payload).encode("utf-8")
         # The manifest payload is sealed with the same body key BUT under a
         # DISTINCT AAD label (gatewayAttachmentManifest) from the body
         # (gatewayAttachmentBody). The phone unwraps the body key once and opens
@@ -1300,9 +1332,13 @@ class _RelaySealer:
         event_id = secrets.token_hex(16)
         payload_aad = _gateway_event_aad(self._uid, self._client_id, event_id)
         key_aad = _gateway_event_key_aad(self._uid, self._client_id, event_id)
-        payload_bytes = json.dumps(
-            {"kind": "model_switch", "modelId": model_id, "destinationId": destination_id}
-        ).encode("utf-8")
+        payload: Dict[str, Any] = {
+            "kind": "model_switch",
+            "modelId": model_id,
+            "destinationId": destination_id,
+        }
+        self._adapter._inject_outbound_replay_counter(destination_id, payload)
+        payload_bytes = json.dumps(payload).encode("utf-8")
         if self._adapter._peer_relay_key_version_for(destination_id) == GATEWAY_RELAY_KEY_VERSION_V4:
             fields = self._seal_signed_v4(
                 peer=peer, sender_private=sender_private, destination_id=destination_id,
@@ -1536,9 +1572,9 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._peer_relay_key_epoch: int = _coerce_replay_counter(
             os.getenv(RELAY_PEER_KEY_EPOCH_ENV)
         ) or 0
-        # Double Ratchet chat-lane sessions (forward secrecy + PCS), keyed by
-        # destination id. Loaded from disk so a session survives restart; bootstrapped
-        # deterministically from the pinned relay keys on first use (no handshake).
+        # Dormant Double Ratchet session cache, keyed by destination id. The old
+        # deterministic bootstrap remains behind a disabled gate until a v4-signed
+        # ratchet-init handshake replaces it.
         self._ratchet_sessions: Dict[str, Any] = {}
         self._ratchet_sessions_loaded = False
         # Only the long-running daemon owns the ratchet session store (stateful,
@@ -1552,7 +1588,7 @@ class BurnBarAdapter(BasePlatformAdapter):
         # high-water mark keeps an old authenticated event from being accepted once
         # after the digest cache saturates.
         self._seen_event_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
-        self._event_replay_high_water = -1
+        self._event_replay_high_water_legacy = -1
         # E2E negotiated at pairing (server reports the link relay-capable).
         self._relay_e2e_enabled = (os.getenv(RELAY_E2E_ENV) or "").strip() == "1"
         # AAD identity binding. uid/clientId are routing ids the server echoes and
@@ -1585,6 +1621,25 @@ class BurnBarAdapter(BasePlatformAdapter):
         self._plaintext_explicitly_allowed = (os.getenv("BURNBAR_ALLOW_PLAINTEXT") or "").strip() == "1"
         if RELAY_CRYPTO_AVAILABLE and self._relay_e2e_enabled:
             self._ensure_relay_identity()
+        self._e2ee_state = BurnBarE2EEStateStore(BURNBAR_E2EE_STATE_FILE)
+        try:
+            self._e2ee_state.load_or_fail_closed(
+                has_e2e_pins=self._relay_e2e_enabled and bool(self._peer_public_key),
+                ledger_path=REPLAY_LEDGER_FILE,
+                legacy_bucket_id=self._replay_ledger_bucket(),
+                target_bucket_id=(
+                    self._signed_replay_bucket(self._home_channel)
+                    if self._relay_e2e_enabled and self._relay_uid and self._relay_client_id
+                    else None
+                ),
+            )
+        except BurnBarE2EEStateError as exc:
+            if self._relay_e2e_enabled:
+                if self._relay_e2e_config_error is None:
+                    self._relay_e2e_config_error = str(exc)
+                logger.error("[%s] SECURITY: %s", self.name, exc)
+            else:
+                logger.warning("[%s] E2EE state unavailable: %s", self.name, exc)
         self._load_replay_ledger()
         self._sealer = _RelaySealer(self)
 
@@ -1677,12 +1732,10 @@ class BurnBarAdapter(BasePlatformAdapter):
         return self._peer_public_keys.get(str(destination_id or "")) or self._peer_public_key
 
     def _ratchet_enabled(self) -> bool:
-        return (
-            self._ratchet_allowed
-            and RELAY_CRYPTO_AVAILABLE
-            and hermes_ratchet is not None
-            and (os.getenv(RELAY_RATCHET_ENABLED_ENV) or "").strip() == "1"
-        )
+        # Disabled until the first ratchet public key is authenticated inside a
+        # v4-signed ratchet-init handshake. Deterministic static-static bootstrap
+        # lets a recipient-static-key holder forge the initiator.
+        return False
 
     def _can_ratchet(self, destination_id: str) -> bool:
         """True when the CHAT lane should use the Double Ratchet: opt-in flag set,
@@ -1695,32 +1748,29 @@ class BurnBarAdapter(BasePlatformAdapter):
             and bool(self._peer_relay_public_for(destination_id))
         )
 
-    @staticmethod
-    def _ratchet_session_was_established(session_id: str) -> bool:
-        established = _read_replay_ledger().get("ratchetSessions")
-        return isinstance(established, dict) and bool(established.get(session_id))
+    def _ratchet_session_id(self, destination_id: str) -> Optional[str]:
+        relay_key = self._relay_private_key()
+        peer_pub = self._peer_relay_public_for(destination_id)
+        if relay_key is None or not peer_pub:
+            return None
+        return hermes_ratchet.derive_session_id(
+            uid=self._relay_uid, client_id=self._relay_client_id,
+            agent_ratchet_public_key_base64=relay_key.public_key_base64(),
+            peer_ratchet_public_key_base64=peer_pub,
+        )
 
-    @staticmethod
-    def _mark_ratchet_session_established(session_id: str) -> None:
-        ledger = _read_replay_ledger()
-        established = ledger.get("ratchetSessions")
-        if not isinstance(established, dict):
-            established = {}
-        established[session_id] = True
-        ledger["ratchetSessions"] = established
-        _write_replay_ledger(ledger)
+    def _ratchet_session_was_established(self, session_id: str) -> bool:
+        return self._e2ee_state.ratchet_lineage_exists(session_id)
+
+    def _mark_ratchet_session_established(self, session_id: str) -> None:
+        self._e2ee_state.mark_ratchet_lineage(session_id)
 
     def _ratchet_session(self, destination_id: str):
-        """Return the cached/persisted ratchet session for one destination, or
-        bootstrap one deterministically from the pinned relay keys (no handshake).
+        """Return a cached/persisted dormant ratchet session for one destination.
 
-        Refuses to SILENTLY re-bootstrap a session that was previously established
-        but is missing from the session store (lost/corrupted): the deterministic
-        bootstrap would re-create an identical pristine session and reopen a replay
-        window for any frames a relay recorded. The link then falls back to the v4
-        signed wrap; restoring FS/PCS requires an authenticated key rotation (which
-        yields a new session id), not a silent reset. The "established" marker lives
-        in the replay ledger — a store SEPARATE from the session file."""
+        The old deterministic bootstrap is retained only behind the disabled
+        ratchet gate. Production ratchet must use a v4-signed init handshake; a
+        missing/corrupt session must never silently re-bootstrap from static keys."""
         self._load_ratchet_sessions()
         key = str(destination_id or "")
         session = self._ratchet_sessions.get(key)
@@ -1921,6 +1971,28 @@ class BurnBarAdapter(BasePlatformAdapter):
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def _signed_replay_bucket(self, destination_id: Optional[str] = None) -> str:
+        dest = str(destination_id or self._home_channel or "").strip() or self._home_channel
+        signing_identity = self._ensure_signing_identity()
+        local_signing_key = (
+            signing_identity.public_key_base64 if signing_identity is not None else None
+        )
+        return stable_signed_bucket_id(
+            uid=self._relay_uid,
+            client_id=self._relay_client_id,
+            destination_id=dest,
+            peer_signing_fingerprint=signing_key_fingerprint(self._peer_signing_key_for(dest)),
+            local_signing_fingerprint=signing_key_fingerprint(local_signing_key),
+        )
+
+    @property
+    def _event_replay_high_water(self) -> int:
+        if not self._relay_e2e_enabled:
+            return self._event_replay_high_water_legacy
+        return self._e2ee_state.get_inbound_high_water(
+            self._signed_replay_bucket(self._home_channel)
+        )
+
     def _event_replay_key(self, event_id: str) -> str:
         material = json.dumps(
             [self._relay_uid, self._relay_client_id, self._replay_peer_fingerprint(), str(event_id)],
@@ -1932,13 +2004,13 @@ class BurnBarAdapter(BasePlatformAdapter):
         """Hydrate the in-memory replay cache from disk (E2E restart hardening)."""
         if reset:
             self._seen_event_ids.clear()
-            self._event_replay_high_water = -1
+            self._event_replay_high_water_legacy = -1
         bucket = self._replay_ledger_bucket()
         entry = _read_replay_ledger().get(bucket, [])
         if isinstance(entry, dict):
             replay_keys = entry.get("ids") if isinstance(entry.get("ids"), list) else []
             high_water = _coerce_replay_counter(entry.get("highWater"))
-            self._event_replay_high_water = high_water if high_water is not None else -1
+            self._event_replay_high_water_legacy = high_water if high_water is not None else -1
         elif isinstance(entry, list):
             replay_keys = entry
         else:
@@ -1955,7 +2027,7 @@ class BurnBarAdapter(BasePlatformAdapter):
         ledger = _read_replay_ledger()
         ledger[bucket] = {
             "ids": ordered_ids[-MAX_SEEN_EVENT_IDS:],
-            "highWater": self._event_replay_high_water,
+            "highWater": self._event_replay_high_water_legacy,
         }
         _write_replay_ledger(ledger)
 
@@ -1982,12 +2054,25 @@ class BurnBarAdapter(BasePlatformAdapter):
             )
         return None
 
-    def _is_replay_counter_seen(self, replay_counter: Optional[int]) -> bool:
-        return (
-            self._relay_e2e_enabled
-            and replay_counter is not None
-            and replay_counter <= self._event_replay_high_water
+    def _is_replay_counter_seen(self, replay_counter: Optional[int], destination_id: Optional[str] = None) -> bool:
+        if not self._relay_e2e_enabled or replay_counter is None:
+            return False
+        return self._e2ee_state.is_replay_counter_seen(
+            self._signed_replay_bucket(destination_id), replay_counter
         )
+
+    def _inject_outbound_replay_counter(self, destination_id: str, payload: Dict[str, Any]) -> None:
+        """Reserve a monotonic outbound counter for the v4 signed lane."""
+        if self._relay_e2e_config_error:
+            raise _RelayPlaintextRefused(self._relay_e2e_config_error)
+        if self._peer_relay_key_version_for(destination_id) != GATEWAY_RELAY_KEY_VERSION_V4:
+            return
+        try:
+            payload["replayCounter"] = self._e2ee_state.reserve_outbound_counter(
+                self._signed_replay_bucket(destination_id)
+            )
+        except (BurnBarE2EEStateError, ValueError) as exc:
+            raise _RelayPlaintextRefused(str(exc)) from exc
 
     def _is_event_seen(self, event_id: str) -> bool:
         """Read-only replay check (MP-3): True if this id was already processed.
@@ -2011,7 +2096,7 @@ class BurnBarAdapter(BasePlatformAdapter):
             return True
         return False
 
-    def _record_event(self, event_id: str, *, replay_counter: Optional[int] = None) -> bool:
+    def _record_event(self, event_id: str, *, replay_counter: Optional[int] = None, destination_id: Optional[str] = None) -> bool:
         """Record replay state — call ONLY after a successful authenticated open.
 
         Recording after authentication (not before) is the replay-cache fix
@@ -2026,24 +2111,27 @@ class BurnBarAdapter(BasePlatformAdapter):
             return not self._relay_e2e_enabled
         key = self._event_replay_key(event_id)
         prior_seen = collections.OrderedDict(self._seen_event_ids)
-        prior_high_water = self._event_replay_high_water
         self._seen_event_ids[key] = None
         self._seen_event_ids.move_to_end(key)
         while len(self._seen_event_ids) > MAX_SEEN_EVENT_IDS:
             self._seen_event_ids.popitem(last=False)
-        if replay_counter is not None:
-            self._event_replay_high_water = max(self._event_replay_high_water, replay_counter)
+
+        e2ee_success = True
         try:
+            if self._relay_e2e_enabled and replay_counter is not None:
+                e2ee_success = self._e2ee_state.check_and_commit_inbound(
+                    self._signed_replay_bucket(destination_id), replay_counter
+                )
+
             self._persist_replay_ledger()
+            if not e2ee_success:
+                return False
             return True
         except Exception:
             logger.warning("[%s] failed to persist BurnBar replay ledger", self.name, exc_info=True)
             if self._relay_e2e_enabled:
                 self._seen_event_ids = prior_seen
-                self._event_replay_high_water = prior_high_water
-            # On E2E links, fail closed before dispatching a side-effect. Legacy
-            # plaintext keeps the in-memory dedup behavior.
-            return not self._relay_e2e_enabled
+            return False
 
     def _absorb_routing_id(self, field: str, value: str) -> None:
         """Confirm-or-warn a runtime routing id (uid/clientId) that feeds every AAD.
@@ -2228,6 +2316,10 @@ class BurnBarAdapter(BasePlatformAdapter):
             _write_cursor(self._cursor)
 
     async def _handle_burnbar_event(self, raw: dict) -> None:
+        if not self._e2ee_state.is_ready:
+            logger.error("[%s] dropped event: E2EE state store is not ready (missing durable cache)", self.name)
+            return
+
         envelope = raw.get("relayEnvelope") if isinstance(raw.get("relayEnvelope"), dict) else {}
         event_id = str(envelope.get("eventId") or raw.get("id") or "")
         # MP-3: read-only replay check BEFORE decrypt. The id is recorded only after
@@ -2257,19 +2349,15 @@ class BurnBarAdapter(BasePlatformAdapter):
             logger.warning("[%s] failed to open sealed event", self.name, exc_info=True)
             return
         if authed is not None:
-            authed = _coalesce_sealed_control_payload(authed)
             kind = str(authed.get("kind") or "").strip()
             sealed_dest = str(authed.get("destinationId") or "").strip()
             if self._relay_e2e_enabled and not sealed_dest:
                 logger.warning("[%s] dropped sealed event without authenticated destinationId", self.name)
                 return
             destination_id = sealed_dest or destination_id
-            # The Double Ratchet chat lane carries chat text ONLY and has its own
-            # out-of-order-tolerant replay defense (single-use message keys + the
-            # monotonic ratchet message-number chain), so it is exempt from the
-            # v4-signed lane's external monotonic replayCounter gate. Control kinds
-            # must NOT arrive on the ratchet lane (they always use the signed lane
-            # with the counter gate); a control kind here is refused.
+            # The ratchet branch is unreachable while the lane is disabled. If it
+            # returns with a signed init handshake, it remains chat-only; controls
+            # stay on the v4 signed lane with the replayCounter gate.
             is_ratchet = isinstance(raw.get("ratchetEnvelope"), dict)
             if is_ratchet and (kind in _CONTROL_EVENT_KINDS or authed.get("modelId") is not None):
                 logger.warning(
@@ -2283,7 +2371,7 @@ class BurnBarAdapter(BasePlatformAdapter):
                 except _RelayPlaintextRefused as exc:
                     logger.warning("[%s] dropped sealed event: %s", self.name, exc)
                     return
-                if self._is_replay_counter_seen(replay_counter):
+                if self._is_replay_counter_seen(replay_counter, destination_id=destination_id):
                     logger.info(
                         "[%s] dropped old sealed event replayCounter=%s highWater=%s",
                         self.name,
@@ -2292,19 +2380,20 @@ class BurnBarAdapter(BasePlatformAdapter):
                     )
                     return
             if kind == APPROVAL_DECISION_KIND:
-                if not self._record_event(event_id, replay_counter=replay_counter):
+                if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id):
                     return
                 await self._handle_sealed_approval_decision(authed)
                 return
             if kind == OVERSIGHT_MODE_KIND:
-                if not self._record_event(event_id, replay_counter=replay_counter):
+                if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id):
                     return
                 self._handle_sealed_oversight_mode(authed)
                 return
             if kind == KEY_ROTATION_KIND:
-                if not self._record_event(event_id, replay_counter=replay_counter):
+                if not self._handle_sealed_key_rotation(authed):
                     return
-                self._handle_sealed_key_rotation(authed)
+                if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id):
+                    return
                 return
             # model_switch is opened as an ordinary sealed event (via open_event)
             # and dispatched here by kind on the OPENED payload — control kinds are
@@ -2341,12 +2430,10 @@ class BurnBarAdapter(BasePlatformAdapter):
         # MP-3: record the authenticated id ONLY now — after a successful open and
         # before dispatch — so only events that actually authenticated consume a
         # cache slot. The signed/legacy lanes rely on this id ledger as their replay
-        # anchor, so a failed record drops the event. The ratchet lane's single-use
-        # message key (already consumed + durably persisted in _open_ratchet) is the
-        # AUTHORITATIVE replay defense, so a transient ledger-persist failure must
-        # NOT lose a message whose ratchet step is already durable — deliver it
-        # (a duplicate frame would fail the ratchet AEAD regardless of the id cache).
-        if not self._record_event(event_id, replay_counter=replay_counter) and not is_ratchet:
+        # anchor, so a failed record drops the event. The ratchet branch is
+        # unreachable while disabled; if it returns with signed init, its durable
+        # message-key advance remains the authoritative replay defense.
+        if not self._record_event(event_id, replay_counter=replay_counter, destination_id=destination_id) and not is_ratchet:
             return
         # MP-8: on an E2E-authenticated event, sender identity MUST come from the
         # sealed payload, never from relay-controlled top-level metadata (which a
@@ -2628,30 +2715,31 @@ class BurnBarAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Could not persist BurnBar oversight mode", self.name, exc_info=True)
 
-    def _handle_sealed_key_rotation(self, authed: dict) -> None:
+    def _handle_sealed_key_rotation(self, authed: dict) -> bool:
         """Apply an authenticated peer key-rotation event (sign-the-successor).
 
         The event was already opened through the sealed v4 path (so the relay never
         saw it in cleartext and could not strip fields); here we verify the detached
         Ed25519 signature against the PINNED peer identity key, check the monotonic
-        epoch + validity window, and atomically swap the pinned peer encryption key.
-        The replay high-water is intentionally NOT reset, so an old frame stays
-        refused across the rotation."""
+        epoch + validity window, durably persist the successor key and epoch in one
+        .env write, then swap the in-memory pin. The replay high-water is recorded
+        by the caller only after this returns true, so a failed key write cannot
+        make the rotation unreplayable while leaving the old key on disk."""
         import base64 as _b64
 
         if not RELAY_CRYPTO_AVAILABLE:
-            return
+            return False
         destination_id = str(authed.get("destinationId") or "")
         peer_signing = self._peer_signing_key_for(destination_id)
         if not peer_signing:
             logger.warning("[%s] dropped key_rotation: no pinned peer signing key", self.name)
-            return
+            return False
         try:
             signed_body = _b64.b64decode(str(authed.get("signedBody") or ""), validate=True)
             signature = _b64.b64decode(str(authed.get("signature") or ""), validate=True)
         except Exception:
             logger.warning("[%s] dropped key_rotation: malformed signedBody/signature", self.name)
-            return
+            return False
         try:
             new_enc = relay_e2ee_v4.verify_rotation_event(
                 signed_body, signature,
@@ -2661,34 +2749,52 @@ class BurnBarAdapter(BasePlatformAdapter):
             )
         except relay_e2ee.RelayCryptoError as exc:
             logger.warning("[%s] rejected key_rotation: %s", self.name, exc)
-            return
+            return False
         new_enc_b64 = _b64.b64encode(new_enc).decode("ascii")
+        new_epoch = self._peer_relay_key_epoch + 1
+        if not self._persist_peer_key_rotation(new_enc_b64, new_epoch):
+            return False
         self._peer_public_key = new_enc_b64
         if destination_id:
             self._peer_public_keys[destination_id] = new_enc_b64
-        self._peer_relay_key_epoch += 1
+        self._peer_relay_key_epoch = new_epoch
         # A new pinned peer key starts a fresh ratchet session lineage; drop the
         # cached AND persisted session so the next message re-bootstraps against the
         # new key (and a crash before then cannot resurrect the stale session).
         self._load_ratchet_sessions()
         if self._ratchet_sessions.pop(destination_id, None) is not None:
             self._save_ratchet_sessions()
-        persist = self._relay_key_persister()
-        if persist is not None:
-            try:
-                # Persist the new key FIRST, then the epoch. A crash between the two
-                # writes leaves {new_key, epoch=0}, which SELF-HEALS: a replay of the
-                # same authenticated 0->1 rotation re-applies idempotently (swap to
-                # the identical key, epoch -> 1). Writing epoch-first would instead
-                # strand the link at {old_key, epoch=1}, requiring a re-pair.
-                persist("BURNBAR_RELAY_PEER_PUBLIC_KEY", new_enc_b64)
-                persist(RELAY_PEER_KEY_EPOCH_ENV, str(self._peer_relay_key_epoch))
-            except Exception:
-                logger.debug("[%s] could not persist rotated peer key", self.name, exc_info=True)
         logger.info(
             "[%s] applied authenticated peer key rotation -> epoch %d",
             self.name, self._peer_relay_key_epoch,
         )
+        return True
+
+    def _persist_peer_key_rotation(self, new_enc_b64: str, new_epoch: int) -> bool:
+        """Persist peer rotation state as one durable config transaction."""
+        persist = self._relay_key_persister()
+        if persist is None:
+            logger.warning("[%s] could not persist rotated peer key: no env persister", self.name)
+            return False
+        try:
+            try:
+                from hermes_cli.config import save_env_values
+            except Exception:  # pragma: no cover - old embedded config module
+                save_env_values = None
+            if save_env_values is not None:
+                save_env_values(
+                    {
+                        "BURNBAR_RELAY_PEER_PUBLIC_KEY": new_enc_b64,
+                        RELAY_PEER_KEY_EPOCH_ENV: str(new_epoch),
+                    }
+                )
+            else:
+                persist("BURNBAR_RELAY_PEER_PUBLIC_KEY", new_enc_b64)
+                persist(RELAY_PEER_KEY_EPOCH_ENV, str(new_epoch))
+            return True
+        except Exception:
+            logger.warning("[%s] could not persist rotated peer key", self.name, exc_info=True)
+            return False
 
     async def _resolve_slash_confirm(
         self,
@@ -3178,9 +3284,24 @@ def interactive_setup() -> None:
         )
         if oversight not in ("supervised", "autonomous"):
             oversight = "supervised"
+        home_destination_id = str(approved.get("homeDestinationId") or DEFAULT_HOME_CHANNEL)
+        try:
+            _initialize_pairing_security_state(
+                uid=str(uid),
+                client_id=str(client_id),
+                destination_id=home_destination_id,
+                peer_signing_key_b64=str(peer_relay_signing_key or ""),
+                local_signing_key_b64=str(agent_relay_signing_key or ""),
+            )
+        except Exception as exc:
+            print_warning(
+                "Could not initialize BurnBar E2E replay state; NOT enabling end-to-end "
+                f"encryption for this link: {exc}"
+            )
+            return
         save_env_value("BURNBAR_API_BASE_URL", api_base)
         save_env_value("BURNBAR_ACCESS_TOKEN", approved["accessToken"])
-        save_env_value("BURNBAR_HOME_CHANNEL", approved.get("homeDestinationId") or DEFAULT_HOME_CHANNEL)
+        save_env_value("BURNBAR_HOME_CHANNEL", home_destination_id)
         save_env_value(OVERSIGHT_MODE_ENV, oversight)
         save_env_value(RELAY_E2E_ENV, "1")
         save_env_value("BURNBAR_RELAY_PEER_PUBLIC_KEY", str(peer_relay_public_key))

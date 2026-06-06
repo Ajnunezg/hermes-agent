@@ -31,11 +31,11 @@ message the agent — and supervise it — from the BurnBar iOS/macOS apps.
   signature** over the v3 HPKE envelope (KCI resistance: a leaked recipient key can
   no longer forge a sender) and **Padmé** length padding. Negotiated only when the
   authenticated pairing grant pins the peer's signing key; the safety code then
-  binds the encryption **and** signing keys. An opt-in **Double Ratchet** chat lane
-  (`BURNBAR_RELAY_RATCHET=1`) gives forward secrecy + post-compromise security for
-  conversational messages, and `key_rotation` is an authenticated successor-key
-  event. See [`SECURITY_V4.md`](SECURITY_V4.md) for the full design, threat-model
-  closure, and honest residuals.
+  binds the encryption **and** signing keys. The experimental Double Ratchet chat
+  lane is disabled until its first public key is authenticated inside a v4-signed
+  `ratchet_init` handshake. `key_rotation` is an authenticated successor-key event.
+  See [`SECURITY_V4.md`](SECURITY_V4.md) for the full design, threat-model closure,
+  and honest residuals.
 - **Safety-code comparison** after setup: when E2E is enabled, the CLI prints the
   same short code BurnBar shows in the Private messages sheet. The prompt defaults
   to **no** and only accepts valid X9.63 P-256 public keys. Matching codes prove
@@ -86,10 +86,13 @@ Optional:
 - `HERMES_BURNBAR_CURSOR_FILE` — overrides the event-cursor cache path.
 - `HERMES_BURNBAR_REPLAY_FILE` — overrides the durable replay-ledger path.
 - `HERMES_BURNBAR_RATCHET_FILE` — overrides the ratchet-session store path (v4).
+- `HERMES_BURNBAR_E2EE_STATE_FILE` — overrides the durable E2E security-state
+  store. This file is integrity-critical and should live outside disposable caches.
 
 v4 hardening (managed by `hermes gateway setup`; rarely set by hand):
 
-- `BURNBAR_RELAY_RATCHET=1` — opt into the Double Ratchet chat lane (FS/PCS).
+- `BURNBAR_RELAY_RATCHET=1` — reserved for a future Double Ratchet chat lane.
+  Current builds refuse ratchet frames and continue using the v4 signed lane.
 - `BURNBAR_DISABLE_GATEWAY_HPKE_V4=1` — break-glass: emit v2/v3 only.
 - `BURNBAR_RELAY_SIGNING_KEY` / `BURNBAR_RELAY_PEER_SIGNING_KEY` — the agent's
   Ed25519 signing seed and the pinned peer signing key (set at pairing).
@@ -130,13 +133,14 @@ constants, the attack matrix, and the v2→v3 migration behaviour.
 For v2/v3, KCI and static-key compromise are explicit non-goals. If the recipient
 static private key is stolen, past messages wrapped to that key can be decrypted
 and an attacker can forge as any sender; the static leg has no post-compromise
-forward secrecy. **v4 closes both:** the Ed25519 explicit signature makes a leaked
-recipient key unable to forge a sender (KCI), and the opt-in Double Ratchet chat
-lane adds forward secrecy + post-compromise security. Remaining residuals (no
-post-quantum, timing/ordering metadata, TOFU pairing) are documented honestly in
-[`SECURITY_V4.md`](SECURITY_V4.md). Replay rejection is enforced by the adapter's
-persisted id ledger plus the sealed replay-counter high-water mark (and, on the
-ratchet lane, by the ratchet's single-use message keys), not by AES-GCM alone.
+forward secrecy. **v4 closes KCI for the production signed lane:** the Ed25519
+explicit signature makes a leaked recipient key unable to forge a sender. Forward
+secrecy and post-compromise security are not claimed until the disabled ratchet
+lane is reintroduced with a v4-signed `ratchet_init` handshake. Remaining residuals
+(signing-key compromise, no post-quantum, timing/ordering metadata, TOFU pairing)
+are documented honestly in [`SECURITY_V4.md`](SECURITY_V4.md). Replay rejection is
+enforced by the adapter's persisted id ledger plus the sealed replay-counter
+high-water mark, not by AES-GCM alone.
 
 Maintainer note: compare the safety code during setup; clicking through without
 checking it gives the relay a first-pairing MITM opportunity.
@@ -149,8 +153,8 @@ From the Hermes repo root:
 # Plugin registration, event mapping, send/typing/attachments, oversight,
 # runtime status + model switch, the relay seal -> open round-trip, the v2/v3
 # key-wrap known-answer vectors (incl. the RFC 9180 Appendix-A HPKE Auth vector),
-# and the v4 hardening (RFC 8032 Ed25519 KAT, Padmé, Double Ratchet FS/PCS,
-# rotation) wired end-to-end through the adapter.
+# and the v4 hardening (RFC 8032 Ed25519 KAT, Padmé, disabled-ratchet receive
+# refusal, rotation) wired end-to-end through the adapter.
 scripts/run_tests.sh \
   tests/gateway/test_burnbar_plugin.py tests/gateway/test_burnbar_plugin_v3.py \
   tests/gateway/test_burnbar_plugin_v4.py tests/gateway/test_relay_e2ee.py \
