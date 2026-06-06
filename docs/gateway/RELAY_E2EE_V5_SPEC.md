@@ -133,12 +133,53 @@ key, responder KEM key id, KEM ciphertext, and replayCounter.
 On successful v2 init, the agent rotates the ratchet-init KEM key in the same
 fsynced session-state write that stores the new ratchet session.
 
+## Attachment Body-Key Wrap
+
+The file body is sealed independently with a per-attachment `body_key`:
+
+`bodyCiphertext = AES-256-GCM(body_key, file_bytes, aad = "...|gatewayAttachmentBody|uid|clientId|attachmentId")`
+
+The body blob (base64 of the sealed body) is uploaded as the attachment content.
+
+**Legacy (v2/v3 link, or peer without signed-attachment support):** unchanged. The
+manifest is sealed with `body_key` under the `gatewayAttachmentManifest` AAD and the
+`body_key` is wrapped with the v2/v3 content-key wrap. No signature.
+
+**Signed (v4/v5 link, peer advertises `supportsGatewayAttachmentWrapVersions`):** the
+`body_key` travels INSIDE the signed manifest as `bodyKeyBase64`, and the manifest is
+sealed exactly like a v4/v5 message envelope:
+
+- `payloadCiphertext` = the v4/v5 signed seal of the manifest JSON
+  `{fileName, byteCount, contentType, destinationId, replayCounter, bodyKeyBase64}`,
+  Padmé-padded, AES-256-GCM under the manifest's own content key.
+- `wrappedKey` + `enc` = the manifest content key wrapped at the pinned version
+  (P-256 HPKE-Auth at v4; hybrid ML-KEM-768/X25519 HPKE at v5).
+- `senderSig` = Ed25519 over the v4/v5 signing transcript with
+  `key_aad = "...|gatewayAttachmentKey|..."` and
+  `payload_aad = "...|gatewayAttachmentManifest|..."`.
+- top-level `attachmentId`, plus the usual `relayKeyVersion`/`relayEncryption`/sender
+  key fields.
+
+To OPEN: verify+open the manifest envelope with `open_signed_v4`/`open_signed_v5`
+(recipient = the receiving peer; pinned sender = the agent), read `bodyKeyBase64`
+from the manifest, then open the body blob under the `gatewayAttachmentBody` AAD.
+The body key — and therefore the file — inherits the link's PQ confidentiality at v5.
+
+`supportsGatewayAttachmentWrapVersions` (list of `{4,5}`) is advertised in the relay
+capability payload; absence means "cannot open a signed attachment wrap" so the agent
+keeps the legacy wrap. On a v5 pin the agent fails closed rather than ship a classical
+body key (`BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS=1` is the migration escape hatch).
+
 ## Fixtures
 
 `tests/gateway/fixtures/hermes_ratchet_init_v2.json` is the parity fixture for the
 v2 ratchet init. It includes deterministic private seeds, expected public keys,
 KEM key id, recorded KEM ciphertext, root-confirm MAC, and root/shared-secret
 hashes.
+
+`tests/gateway/test_v5_attachment_wrap.py` round-trips the signed attachment wrap
+(v4 and v5) by opening the agent's own output the way the phone must, and is the
+executable reference for the format above.
 
 ## Residuals
 
