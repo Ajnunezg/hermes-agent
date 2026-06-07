@@ -1,11 +1,14 @@
 """Tests for the BurnBar Cloud platform-plugin adapter.
 
-Covers the messaging surface: registration, config, inbound mapping, send,
-attachments, cursor, and oversight/runtime-status.
+Covers the platform messaging surface: registration, config, inbound mapping, send,
+attachments, cursor, oversight, runtime status, and model-switch handling. The
+relay safety-code helper remains here because setup prints it even before the
+full E2EE path is exercised.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import MagicMock
 
@@ -22,6 +25,22 @@ validate_config = _burnbar.validate_config
 is_connected = _burnbar.is_connected
 _env_enablement = _burnbar._env_enablement
 _apply_yaml_config = _burnbar._apply_yaml_config
+_relay_safety_code = _burnbar._relay_safety_code
+
+try:
+    from plugins.platforms.burnbar import relay_e2ee
+
+    RELAY_CRYPTO_AVAILABLE = True
+except ImportError:  # pragma: no cover - cryptography missing in CI slice.
+    # Narrow to ImportError, matching adapter.py: a broad `except Exception`
+    # would mask a real crypto fault (FIPS rejection, missing system lib) as
+    # "crypto unavailable" and silently skip the entire E2E test surface green.
+    relay_e2ee = None
+    RELAY_CRYPTO_AVAILABLE = False
+
+requires_relay = pytest.mark.skipif(
+    not RELAY_CRYPTO_AVAILABLE, reason="cryptography / relay_e2ee unavailable"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +164,39 @@ def test_env_enablement_none_when_token_missing(monkeypatch):
     assert _env_enablement() is None
 
 
+@requires_relay
+def test_relay_safety_code_is_two_key_signal_style_128_bit():
+    # The safety code hashes both paired relay keys, sorted by raw bytes, so
+    # the agent and the phone derive the same code without agreeing on roles. A
+    # relay that substitutes the phone key at first pin therefore changes the
+    # human-verified code (the old single-key code would still have matched).
+    agent = relay_e2ee.generate_private_key().public_key_base64()
+    phone = relay_e2ee.generate_private_key().public_key_base64()
+    other = relay_e2ee.generate_private_key().public_key_base64()
+    code = _relay_safety_code(agent, phone)
+    raw_agent = relay_e2ee.public_key_x963_from_base64(agent)
+    raw_phone = relay_e2ee.public_key_x963_from_base64(phone)
+    low, high = sorted((raw_agent, raw_phone))
+    import hashlib
+
+    expected_digest = hashlib.sha256(low + high).digest()
+    expected = " ".join(expected_digest[offset : offset + 2].hex().upper() for offset in range(0, 16, 2))
+    assert code == expected
+    # Role-independent: sorting the raw keys means argument order does not matter.
+    assert _relay_safety_code(phone, agent) == code
+    # >=128 bits == eight 4-hex-digit groups (not the old 64-bit single-key code).
+    assert len(code.split()) == 8
+    # Sensitivity: substituting either key changes the code,
+    # so a relay key-substitution at first pin is detectable by the human.
+    assert _relay_safety_code(agent, other) != code
+    assert _relay_safety_code(other, phone) != code
+    # A missing/invalid key yields no code, never a plausible-looking one.
+    assert _relay_safety_code(agent, "") == ""
+    assert _relay_safety_code("", phone) == ""
+    assert _relay_safety_code(agent, "not-base64!") == ""
+    assert _relay_safety_code(agent, "AQIDBAUGBwg=") == ""
+
+
 def test_apply_yaml_config_preserves_env_precedence(monkeypatch):
     monkeypatch.setenv("BURNBAR_ACCESS_TOKEN", "env-token")
     platform_cfg = {"extra": {"existing": "value"}}
@@ -172,6 +224,7 @@ def test_adapter_identity_and_defaults(monkeypatch):
     from gateway.config import Platform
 
     monkeypatch.delenv("BURNBAR_API_BASE_URL", raising=False)
+    monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:phone"})
     adapter = BurnBarAdapter(cfg)
 
@@ -179,6 +232,8 @@ def test_adapter_identity_and_defaults(monkeypatch):
     assert adapter._api_base == _burnbar.DEFAULT_API_BASE_URL
     assert adapter._token == "tok"
     assert adapter._home_channel == "burnbar:phone"
+    # Legacy default: no E2E negotiated -> plaintext path stays available.
+    assert adapter._relay_e2e_enabled is False
 
 
 def test_safe_exception_message_redacts_upload_urls_and_tokens():
@@ -311,17 +366,19 @@ def test_interactive_setup_normalizes_explicit_sender_allowlist(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Inbound mapping + cursor
+# Inbound mapping (legacy plaintext) + cursor
 # ---------------------------------------------------------------------------
-def _adapter(monkeypatch, tmp_path):
+def _legacy_adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(_burnbar, "CURSOR_FILE", tmp_path / "cursor.json")
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
     return BurnBarAdapter(cfg)
 
 
 @pytest.mark.asyncio
 async def test_inbound_event_maps_to_gateway_message_event(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     received = []
 
     async def capture(event):
@@ -352,7 +409,7 @@ async def test_inbound_event_maps_to_gateway_message_event(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_model_switch_event_synthesizes_model_command(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     received = []
 
     async def capture(event):
@@ -369,7 +426,7 @@ async def test_model_switch_event_synthesizes_model_command(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_model_switch_rejects_unsafe_model_id(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     received = []
 
     async def capture(event):
@@ -419,11 +476,11 @@ def test_cursor_round_trip(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Send happy / error + attachment
+# Send happy / error + attachment (legacy plaintext path)
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_send_happy_path_posts_message(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+async def test_send_happy_path_posts_plaintext_when_legacy(tmp_path, monkeypatch):
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     client = _RecordingClient(
         post_responses={"/messages": _FakeResponse({"message": {"id": "msg_1"}})}
     )
@@ -437,11 +494,12 @@ async def test_send_happy_path_posts_message(tmp_path, monkeypatch):
     assert url.endswith("/messages")
     assert body["text"] == "all done"
     assert body["replyToEventId"] == "evt_9"
+    assert "relayEnvelope" not in body
 
 
 @pytest.mark.asyncio
 async def test_send_error_returns_failure(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     client = _RecordingClient(post_responses={"/messages": _FakeResponse(status_code=500)})
     adapter._client = client
 
@@ -452,7 +510,7 @@ async def test_send_error_returns_failure(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_local_file_inits_uploads_and_posts(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     f = tmp_path / "report.txt"
     f.write_text("payload-bytes")
     client = _RecordingClient(
@@ -469,10 +527,10 @@ async def test_send_local_file_inits_uploads_and_posts(tmp_path, monkeypatch):
 
     assert result.success is True
     assert result.message_id == "msg_att"
-    # init carried the fileName.
+    # init carried plaintext fileName on the legacy path.
     init_url, init_body = next((u, b) for (u, b) in client.posts if u.endswith("/attachments/init"))
     assert init_body["fileName"] == "report.txt"
-    # body uploaded verbatim to the signed URL.
+    # body uploaded verbatim (no sealing) to the signed URL.
     assert client.puts and client.puts[0][1] == b"payload-bytes"
     # the message references the attachment id.
     _, msg_body = next((u, b) for (u, b) in client.posts if u.endswith("/messages"))
@@ -484,7 +542,7 @@ async def test_send_local_file_inits_uploads_and_posts(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_refresh_oversight_mode_reads_state(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     adapter._client = _RecordingClient(
         get_responses={"/state": _FakeResponse({"oversightMode": "autonomous"})}
     )
@@ -495,7 +553,7 @@ async def test_refresh_oversight_mode_reads_state(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_autonomous_oversight_auto_approves(tmp_path, monkeypatch):
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     adapter._client = _RecordingClient()
     adapter._oversight_mode = "autonomous"
     resolved = {}
@@ -513,7 +571,7 @@ async def test_autonomous_oversight_auto_approves(tmp_path, monkeypatch):
 async def test_supervised_oversight_arms_gate_and_waits(tmp_path, monkeypatch):
     """Supervised mode must NOT auto-approve: it arms the BurnBar approval gate,
     records a pending confirm, and waits for the phone decision."""
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     adapter._client = _RecordingClient(
         post_responses={"/approvals": _FakeResponse({}), "/messages": _FakeResponse({"message": {"id": "m"}})}
     )
@@ -541,7 +599,7 @@ async def test_supervised_falls_back_when_arm_fails(tmp_path, monkeypatch):
     """If the approval gate cannot be armed, supervised mode falls back to the
     base text-confirm (which still requires an explicit /approve) instead of
     silently proceeding."""
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     adapter._client = _RecordingClient(post_responses={"/approvals": _FakeResponse(status_code=500)})
     adapter._oversight_mode = "supervised"
     fell_back = {"called": False}
@@ -562,7 +620,7 @@ async def test_supervised_falls_back_when_arm_fails(tmp_path, monkeypatch):
 async def test_supervised_approval_poll_404_keeps_pending_confirm(tmp_path, monkeypatch):
     """A transient 404 from the approval poll must not silently drop a pending
     slash-confirm without an explicit approve/reject/expire decision."""
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     adapter._client = _RecordingClient(get_responses={"/approvals": _FakeResponse(status_code=404)})
     adapter._pending_confirms["cid"] = {
         "session_key": "sk",
@@ -587,7 +645,7 @@ async def test_attachment_over_limit_fails_cleanly(tmp_path, monkeypatch):
     """A file over MAX_ATTACHMENT_BYTES is rejected as a clean SendResult
     failure before any upload, and an empty file is likewise rejected."""
     monkeypatch.setattr(_burnbar, "MAX_ATTACHMENT_BYTES", 8)
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     client = _RecordingClient(
         post_responses={"/attachments/init": _FakeResponse({"attachment": {"id": "x"}})}
     )
@@ -610,7 +668,7 @@ async def test_attachment_over_limit_fails_cleanly(tmp_path, monkeypatch):
 async def test_poll_isolates_one_malformed_event_in_a_batch(tmp_path, monkeypatch):
     """One poison event must not abort the batch or stall the cursor: siblings
     still dispatch and the cursor advances past the whole page."""
-    adapter = _adapter(monkeypatch, tmp_path)
+    adapter = _legacy_adapter(monkeypatch, tmp_path)
     events = [
         {"id": "evt_a", "destinationId": "burnbar:home", "text": "first"},
         {"id": "evt_bad", "destinationId": "burnbar:home", "text": "boom"},

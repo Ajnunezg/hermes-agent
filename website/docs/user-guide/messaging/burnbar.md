@@ -22,6 +22,7 @@ and route scheduled `deliver=burnbar` notifications to a home destination.
 | **Replies** | Hermes sends through `/messages`. |
 | **Typing** | Hermes publishes typing state through `/typing`. |
 | **Attachments** | Hermes initializes signed uploads through `/attachments/init`. |
+| **Relay content encryption** | On a paired link, sealed message and attachment bodies are relay-blind with a static-key wrap. |
 | **Oversight** | Supervised mode gates slash confirmations; autonomous mode auto-approves. |
 | **Cron delivery** | `deliver=burnbar` sends to `BURNBAR_HOME_CHANNEL`. |
 
@@ -51,6 +52,8 @@ The setup flow writes the required token automatically:
 | `BURNBAR_HOME_CHANNEL_NAME` | Human-readable label for the home destination. |
 | `BURNBAR_ALLOWED_USERS` | Comma-separated BurnBar sender IDs allowed to reach Hermes. |
 | `BURNBAR_ALLOW_ALL_USERS` | Set to `true` only for a trusted account/workspace. |
+| `BURNBAR_OVERSIGHT_MODE` | E2E-paired oversight mode. Defaults to `supervised`. |
+| `BURNBAR_ALLOW_PLAINTEXT` | Set to `1` only to opt back into the legacy plaintext relay path after this agent holds an E2E relay identity. |
 
 You can also set non-secret defaults in `config.yaml` under the BurnBar platform
 entry. Secrets belong in `.env`.
@@ -67,13 +70,41 @@ platforms:
 
 ## Oversight Mode
 
-BurnBar's server-owned `/state` response controls the current oversight mode:
+On legacy plaintext links, BurnBar's server-owned `/state` response controls the
+current oversight mode:
 
 - `supervised` arms a phone approval gate before slash-confirm actions proceed
 - `autonomous` allows the adapter to auto-approve those actions
 
-The adapter refreshes this state while polling, so the phone remains the control
-surface for changing the mode.
+On E2E-paired links, the relay-visible `/state` toggle is not authoritative.
+The mode is pinned from pairing state (`BURNBAR_OVERSIGHT_MODE`) and can change
+only through phone-authenticated sealed `oversight_mode` events.
+Supervised approval prompts keep the readable summary, command, file path, and
+tool arguments in the sealed message channel. The relay-visible approval gate
+still carries the opaque action id, destination id, and coarse `toolName`.
+
+## Relay Content Encryption
+
+When the BurnBar client and Hermes link are E2E-paired, the adapter uses the
+`p256-hkdf-sha256-aesgcm` relay wire format from
+`plugins.platforms.burnbar.relay_e2ee`:
+
+- outgoing reply bodies, attachment manifests/bytes, sender names, file names,
+  content types, and readable approval prompt details are sealed to the phone's
+  pinned relay key
+- inbound sealed events must be version 2 and authenticate as the pinned phone
+  sender key
+- plaintext is refused on paired links
+
+This is relay-content confidentiality, not Signal-grade metadata privacy. The
+relay still sees routing ids, event/message ids, timing, approximate ciphertext
+sizes, typing indicators, attachment ids, approval action ids, coarse approval
+`toolName`, runtime model-catalog/current-model/provider status, agent version,
+and relay key/envelope metadata such as `relayEncryption`, `relayKeyVersion`,
+sender/recipient public keys, wrapped keys, ciphertext fields, and ciphertext
+lengths. The static-key leg has no post-compromise forward secrecy; see
+`plugins/platforms/burnbar/SECURITY.md` in the repository for the exact threat
+model.
 
 ## Troubleshooting
 
@@ -97,5 +128,10 @@ The plugin tests load the adapter through the same plugin-loader guard used by
 the Hermes gateway tests:
 
 ```bash
-scripts/run_tests.sh tests/gateway/test_burnbar_plugin.py
+scripts/run_tests.sh \
+  tests/gateway/test_burnbar_plugin.py \
+  tests/gateway/test_burnbar_e2ee.py \
+  tests/gateway/test_relay_e2ee.py \
+  tests/gateway/test_relay_e2ee_v2.py \
+  tests/gateway/test_wire_vectors_reproducible.py
 ```
