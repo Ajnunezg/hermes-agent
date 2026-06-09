@@ -190,6 +190,51 @@ def _build_provider_env_blocklist() -> frozenset:
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
 
+# ---------------------------------------------------------------------------
+# Optional hardened subprocess-env filtering (security remediation M-7).
+#
+# By design (and after a security review — GHSA-rhgp-j443-p4rf), Hermes lets
+# the user's own non-provider environment flow into terminal subprocesses: the
+# agent acts as the user, so the user's shell env is the intended posture. The
+# exact-name blocklist above only strips Hermes-managed provider secrets, so a
+# THIRD-PARTY secret the user happens to export (AWS_SECRET_ACCESS_KEY,
+# STRIPE_API_KEY, a CI token, etc.) is still visible to agent-run commands and
+# could be exfiltrated.
+#
+# For operators who run the agent under remote control and want a tighter
+# default, opt in with `HERMES_HARDEN_SUBPROCESS_ENV=1` (or
+# `security.harden_subprocess_env: true`). When enabled, env vars whose NAME
+# looks like a secret are also stripped — unless explicitly allow-listed via
+# the existing `env_passthrough` mechanism, which always wins. Default OFF to
+# preserve the reviewed "agent == user" behavior.
+# ---------------------------------------------------------------------------
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?:^|_)(?:"
+    r"SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|CREDENTIALS|"
+    r"PRIVATE_KEY|PRIVATEKEY|API_?KEY|APIKEY|ACCESS_KEY|SECRET_KEY|"
+    r"CLIENT_SECRET|SESSION_TOKEN|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN"
+    r")(?:$|_)|^AWS_(?:SECRET|SESSION)|^GH_TOKEN$|^GITHUB_TOKEN$",
+    re.IGNORECASE,
+)
+
+
+def _harden_subprocess_env_enabled() -> bool:
+    """True when the opt-in hardened env filter is active (default False)."""
+    raw = os.getenv("HERMES_HARDEN_SUBPROCESS_ENV")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from hermes_cli.config import load_config
+        return bool((load_config().get("security", {}) or {}).get("harden_subprocess_env", False))
+    except Exception:
+        return False
+
+
+def _looks_like_secret_env_name(key: str) -> bool:
+    """Heuristic: does this env var NAME look like it holds a secret?"""
+    return bool(_SECRET_ENV_NAME_RE.search(key))
+
+
 def _inject_context_hermes_home(env: dict) -> None:
     """Bridge the context-local Hermes home override into subprocess env."""
     try:
@@ -211,17 +256,30 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized: dict[str, str] = {}
 
+    _harden = _harden_subprocess_env_enabled()
+
+    def _blocked(name: str) -> bool:
+        # Explicit passthrough always wins (operator opt-in escape hatch).
+        if _is_passthrough(name):
+            return False
+        if name in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            return True
+        # Opt-in hardened mode also strips third-party secret-shaped names.
+        if _harden and _looks_like_secret_env_name(name):
+            return True
+        return False
+
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if not _blocked(key):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             sanitized[real_key] = value
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        elif not _blocked(key):
             sanitized[key] = value
 
     _inject_context_hermes_home(sanitized)

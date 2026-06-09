@@ -71,7 +71,13 @@ def _load_security_config() -> dict:
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
-        "tirith_fail_open": True,
+        # Fail CLOSED by default (security remediation): if the policy scanner
+        # cannot run (spawn error, timeout, install-in-progress), the command is
+        # routed through the approval flow instead of being silently allowed. A
+        # prompt-injected model must not get a free pass just because the scanner
+        # is momentarily unavailable. Operators who accept the risk can opt back
+        # into fail-open via `security.tirith_fail_open: true` or TIRITH_FAIL_OPEN=1.
+        "tirith_fail_open": False,
     }
     try:
         from hermes_cli.config import load_config
