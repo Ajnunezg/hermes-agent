@@ -166,9 +166,11 @@ from the manifest, then open the body blob under the `gatewayAttachmentBody` AAD
 The body key — and therefore the file — inherits the link's PQ confidentiality at v5.
 
 `supportsGatewayAttachmentWrapVersions` (list of `{4,5}`) is advertised in the relay
-capability payload; absence means "cannot open a signed attachment wrap" so the agent
-keeps the legacy wrap. On a v5 pin the agent fails closed rather than ship a classical
-body key (`BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS=1` is the migration escape hatch).
+capability payload. Pairing setup persists the authenticated peer value as
+`BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS` and clears stale values when the grant
+omits it. Absence means "cannot open a signed attachment wrap" so the agent keeps the
+legacy wrap. On a v5 pin the agent fails closed rather than ship a classical body key
+(`BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS=1` is the migration escape hatch).
 
 ## Fixtures
 
@@ -185,5 +187,5 @@ executable reference for the format above.
 
 v5 protects the relay content-key wrap and ratchet root bootstrap with a hybrid
 post-quantum KEM. The ongoing Double Ratchet still uses P-256. Full June-2026
-SOTA remains an official libsignal Triple Ratchet/SPQR migration or equivalent
+SOTA would require an audited post-quantum ratchet migration or equivalent
 ongoing PQ ratchet.

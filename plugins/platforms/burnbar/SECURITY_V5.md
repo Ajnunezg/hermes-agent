@@ -88,7 +88,8 @@ gap for FILE contents. v5 closes it:
   sealed separately under its own distinct AAD.
 - **Capability negotiation:** the peer advertises
   `supportsGatewayAttachmentWrapVersions` (a list of v4/v5); the agent reads the
-  peer's authenticated value from `BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS`.
+  peer's authenticated value during pairing and persists it as
+  `BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS` (cleared on re-pair when absent).
   Absent ⇒ the legacy v2/v3 wrap is kept byte-for-byte, so a phone that has not
   shipped signed-attachment open is never bricked.
 - **Stopgap (fail closed):** on a v5 pin, if a v5 attachment wrap cannot be emitted

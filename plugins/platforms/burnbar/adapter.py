@@ -813,17 +813,38 @@ def _coerce_peer_relay_key_version_floor(value: Any) -> int:
 def _coerce_attachment_wrap_versions(value: Any) -> "set[int]":
     """Parse the peer's authenticated signed-attachment-open capability.
 
-    Accepts a comma list (e.g. "4,5"). Only v4/v5 are meaningful — v2/v3 is the
-    legacy unsigned body-key wrap, always available. An absent/garbage value yields
-    an empty set, i.e. "the peer cannot open a signed attachment wrap", so emission
-    keeps the legacy wrap and a v5 link fails closed (no silent classical body)."""
-    if not isinstance(value, str):
+    Accepts a comma list (e.g. "4,5") from env or an authenticated grant list.
+    Only v4/v5 are meaningful; v2/v3 is the legacy unsigned body-key wrap, always
+    available. An absent/garbage value yields an empty set, i.e. "the peer cannot
+    open a signed attachment wrap", so emission keeps the legacy wrap and a v5
+    link fails closed (no silent classical body)."""
+    if isinstance(value, str):
+        parts: Any = value.replace(" ", "").split(",")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        parts = value
+    else:
         return set()
     out: "set[int]" = set()
-    for part in value.replace(" ", "").split(","):
+    for part in parts:
         parsed = _coerce_replay_counter(part)
         if parsed in (GATEWAY_RELAY_KEY_VERSION_V4, GATEWAY_RELAY_KEY_VERSION_V5):
             out.add(parsed)
+    return out
+
+
+def _peer_attachment_wrap_versions_from_pairing_grant(approved: dict, client_payload: dict) -> "set[int]":
+    """Read signed-attachment-open capability from the authenticated grant only."""
+    version_keys = (
+        "supportsGatewayAttachmentWrapVersions",
+        "gatewayAttachmentWrapVersions",
+        "signedAttachmentWrapVersions",
+    )
+    out: "set[int]" = set()
+    for source in (approved, client_payload):
+        if not isinstance(source, dict):
+            continue
+        for key in version_keys:
+            out.update(_coerce_attachment_wrap_versions(source.get(key)))
     return out
 
 
@@ -1589,10 +1610,12 @@ class _RelaySealer:
             "contentType": content_type,
             "destinationId": destination_id,
         }
-        self._adapter._inject_outbound_replay_counter(destination_id, manifest_payload)
         # Choose the body-KEY transport version. On a v5 pin this fails closed rather
-        # than silently shipping a classical body-key wrap (Finding B).
+        # than silently shipping a classical body-key wrap (Finding B). Resolve it
+        # BEFORE reserving a replay counter so refused sends do not burn durable
+        # counter state.
         version = self._adapter._emit_attachment_wrap_version_or_refuse(destination_id)
+        self._adapter._inject_outbound_replay_counter(destination_id, manifest_payload)
         if version in (GATEWAY_RELAY_KEY_VERSION_V5, GATEWAY_RELAY_KEY_VERSION_V4):
             # Signed lane: carry the body key INSIDE the signed manifest, whose own
             # content key is wrapped at the pinned version (hybrid ML-KEM at v5). The
@@ -4074,6 +4097,7 @@ def interactive_setup() -> None:
         print_warning,
         prompt,
         prompt_yes_no,
+        remove_env_value,
         save_env_value,
     )
 
@@ -4197,6 +4221,9 @@ def interactive_setup() -> None:
     # (never the untrusted runtime relay path). Floors to v2 unless the grant
     # advertises v3, so a v2-only peer is never auto-upgraded.
     peer_relay_key_version = _peer_relay_key_version_from_pairing_grant(approved, client_payload)
+    peer_attachment_wrap_versions = _peer_attachment_wrap_versions_from_pairing_grant(
+        approved, client_payload
+    )
     # The peer's Ed25519 signing key (v4), from the authenticated grant only.
     peer_relay_signing_key = (
         approved.get("phoneRelaySigningKey")
@@ -4324,6 +4351,13 @@ def interactive_setup() -> None:
         save_env_value(RELAY_E2E_ENV, "1")
         save_env_value("BURNBAR_RELAY_PEER_PUBLIC_KEY", str(peer_relay_public_key))
         save_env_value(RELAY_PEER_KEY_VERSION_ENV, str(peer_relay_key_version))
+        if peer_attachment_wrap_versions:
+            save_env_value(
+                RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV,
+                ",".join(str(v) for v in sorted(peer_attachment_wrap_versions)),
+            )
+        else:
+            remove_env_value(RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV)
         if peer_relay_signing_key:
             save_env_value(RELAY_PEER_SIGNING_KEY_ENV, str(peer_relay_signing_key))
         if peer_relay_kem_key:

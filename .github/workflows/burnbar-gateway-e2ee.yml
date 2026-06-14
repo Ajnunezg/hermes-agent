@@ -1,0 +1,115 @@
+name: BurnBar Gateway E2EE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/burnbar-gateway-e2ee.yml"
+      - "docs/gateway/**"
+      - "gateway/crypto/**"
+      - "plugins/platforms/burnbar/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "tests/gateway/fixtures/**"
+      - "tests/gateway/test_adversarial_v5_handoff.py"
+      - "tests/gateway/test_audit_adversarial.py"
+      - "tests/gateway/test_burnbar_e2ee*.py"
+      - "tests/gateway/test_burnbar_plugin*.py"
+      - "tests/gateway/test_hermes_ratchet.py"
+      - "tests/gateway/test_relay_e2ee*.py"
+      - "tests/gateway/test_v5_*.py"
+      - "tests/gateway/test_wire_vectors_reproducible.py"
+      - "tests/gateway/vectors/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/burnbar-gateway-e2ee.yml"
+      - "docs/gateway/**"
+      - "gateway/crypto/**"
+      - "plugins/platforms/burnbar/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "tests/gateway/fixtures/**"
+      - "tests/gateway/test_adversarial_v5_handoff.py"
+      - "tests/gateway/test_audit_adversarial.py"
+      - "tests/gateway/test_burnbar_e2ee*.py"
+      - "tests/gateway/test_burnbar_plugin*.py"
+      - "tests/gateway/test_hermes_ratchet.py"
+      - "tests/gateway/test_relay_e2ee*.py"
+      - "tests/gateway/test_v5_*.py"
+      - "tests/gateway/test_wire_vectors_reproducible.py"
+      - "tests/gateway/vectors/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: burnbar-gateway-e2ee-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install BurnBar E2EE test dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[dev,gateway-e2ee]"
+
+      - name: Verify ML-KEM HPKE support
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import cryptography
+          from cryptography.hazmat.primitives import hpke
+
+          assert tuple(map(int, cryptography.__version__.split(".")[:2])) >= (48, 0)
+          assert hasattr(hpke, "MLKEM768X25519PrivateKey")
+          assert hasattr(hpke, "MLKEM768X25519PublicKey")
+          PY
+
+      - name: Run BurnBar gateway E2EE tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/gateway/test_burnbar_plugin.py \
+            tests/gateway/test_burnbar_e2ee_state_store.py \
+            tests/gateway/test_burnbar_plugin_v3.py \
+            tests/gateway/test_burnbar_plugin_v4.py \
+            tests/gateway/test_burnbar_plugin_v5.py \
+            tests/gateway/test_relay_e2ee.py \
+            tests/gateway/test_relay_e2ee_v2.py \
+            tests/gateway/test_relay_e2ee_v3.py \
+            tests/gateway/test_relay_e2ee_v4.py \
+            tests/gateway/test_relay_e2ee_v5.py \
+            tests/gateway/test_hermes_ratchet.py \
+            tests/gateway/test_adversarial_v5_handoff.py \
+            tests/gateway/test_audit_adversarial.py \
+            tests/gateway/test_v5_adversarial_probe.py \
+            tests/gateway/test_v5_attachment_wrap.py \
+            tests/gateway/test_wire_vectors_reproducible.py \
+            -q -rA --junitxml=/tmp/burnbar-gateway-e2ee.xml
+
+      - name: Fail on unexpected security-test skips
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("/tmp/burnbar-gateway-e2ee.xml").getroot()
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in root.iter("testsuite"))
+          if skipped:
+              print(f"BurnBar gateway E2EE tests skipped {skipped} case(s); this gate requires zero skips.")
+              sys.exit(1)
+          PY

@@ -69,6 +69,8 @@ source .venv/bin/activate
 pytest tests/gateway/test_relay_e2ee_v5.py -q
 pytest tests/gateway/test_burnbar_plugin_v5.py -q
 pytest tests/gateway/test_audit_adversarial.py -q
+pytest tests/gateway/test_adversarial_v5_handoff.py -q
+pytest tests/gateway/test_v5_adversarial_probe.py -q
 pytest tests/gateway/test_burnbar_plugin_v4.py tests/gateway/test_relay_e2ee_v4.py \
   tests/gateway/test_hermes_ratchet.py tests/gateway/test_burnbar_e2ee_state_store.py -q
 ```
@@ -101,7 +103,59 @@ Report only findings you reproduce. For each:
 
 ## Known Residuals That Are Not Bugs By Themselves
 
-- Ongoing ratchet remains P-256, not SPQR/Triple Ratchet.
+- Ongoing ratchet remains P-256; ongoing post-quantum ratchet recovery is a
+  BurnBar product-lane roadmap item, not part of the MIT upstream lane.
 - Sender authentication remains Ed25519, not hybrid/PQ signature.
 - Pairing is still TOFU plus human safety-code confirmation.
 - Metadata outside encrypted payloads remains visible to the relay.
+
+## Audit Results (2026-06-05)
+
+**165 tests passed** across the required repro suites plus the hostile follow-ups in
+`test_adversarial_v5_handoff.py` and `test_v5_adversarial_probe.py`.
+
+| Claim | Status | Primary repro |
+|-------|--------|---------------|
+| 1. v5 opens only on pinned peer Ed25519 sig | Verified | `test_v5_valid_hpke_wrong_signature_refused` |
+| 2. Recipient KEM holder cannot forge sender | Verified | `test_v5_valid_signature_wrong_recipient_kem_refused` |
+| 3. v5-pinned link refuses v4/v3/v2 downgrade | Verified | `test_v5_relabeled_version_refused`, `test_missing_local_kem_seed_refuses_v4_frame_fail_closed` |
+| 4. v2 init refuses transmitted `rootKeyBase64` | Verified | `test_v2_init_transmitted_root_key_refused_through_full_handler` |
+| 5. v2 root derived from KEM + transcript MAC | Verified | `test_v2_init_every_field_mutation_refused` (incl. `rootConfirmMacBase64`) |
+| 6. Every v2 binding field mutation refused | Verified | `test_v2_init_every_field_mutation_refused` |
+| 7. Successful v2 init rotates KEM key | Verified | `test_v2_init_rotates_kem_key_and_blocks_replay` |
+| 8. Ratchet advertised by default; disable stops ad + use | Verified (fixed) | `test_ratchet_disabled_kills_advertisement` |
+| 9. Rolled-back session below high-water refused | Verified | `test_v2_receive_high_water_rollback_refused`, `test_restored_old_v5_session_file_refused_after_high_water` |
+| 10. JSON-looking chat stays chat; controls dropped | Verified | `test_v2_ratchet_control_payload_dropped_text_preserved` |
+| 11. v1–v4 byte-stable + stricter replay commit | Verified | `test_burnbar_plugin_v4.py` regression suite |
+
+No confidentiality or integrity breaks reproduced on the production receive path.
+
+## Findings
+
+### FIXED — `BURNBAR_DISABLE_GATEWAY_RATCHET=1` did not block capability advertisement
+
+- **Severity**: Low (use was blocked, but peer could be confused by advertised keys)
+- **File/Line**: `plugins/platforms/burnbar/adapter.py` — instance methods
+  `_ratchet_init_public_key_for_advertisement` and
+  `_ratchet_init_kem_key_for_advertisement` (module-level helpers at ~725 already
+  gated correctly)
+- **Runnable Repro**: `pytest tests/gateway/test_adversarial_v5_handoff.py::test_ratchet_disabled_kills_advertisement -q`
+- **Exploit Impact**: A peer could initiate a ratchet handshake believing the agent
+  supports it, only for the agent to drop initiation because `_can_ratchet` blocked use.
+- **Fix applied**: Check `_gateway_ratchet_disabled()` before returning advertisement
+  material in both instance methods.
+- **Catching regression tests**: `test_ratchet_disabled_kills_advertisement`,
+  `test_ratchet_disabled` in `tests/gateway/test_audit_adversarial.py`.
+
+### FIXED — v1/v2 init crash between session write and lineage write self-heals
+
+- **Severity before fix**: Info / liveness (fail-closed; chat fell back to the signed lane)
+- **File/Line**: `plugins/platforms/burnbar/adapter.py` — v1/v2 idempotent init branches
+- **Runnable Regression**:
+  `pytest tests/gateway/test_v5_adversarial_probe.py::test_v2_init_crash_orphan_self_heals -q`
+- **Fix**: if a fully re-authenticated init hits the existing-session branch and the
+  durable lineage marker is absent, the adapter re-marks lineage before returning.
+  The v2 branch is reached only after the v5 signature, replay gate, X-Wing decap,
+  and root-confirm MAC pass; the v1 branch is reached only after signed-lane
+  authentication and replay gating.
+- **Catching regression test**: `test_v2_init_crash_orphan_self_heals`.

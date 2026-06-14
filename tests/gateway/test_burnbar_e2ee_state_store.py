@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from plugins.platforms.burnbar import e2ee_state_store as state_store_module
 from plugins.platforms.burnbar.e2ee_state_store import (
     MAX_REPLAY_COUNTER,
     BurnBarE2EEStateError,
@@ -108,3 +109,30 @@ def test_outbound_counter_monotonic_and_persisted(tmp_path):
     second = BurnBarE2EEStateStore(path)
     second.load_or_fail_closed(has_e2e_pins=True)
     assert second.reserve_outbound_counter(bucket) == 3
+
+
+def test_atomic_write_retries_short_os_write(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    bucket = stable_signed_bucket_id(
+        uid="u",
+        client_id="c",
+        destination_id="d",
+        peer_signing_fingerprint="p",
+        local_signing_fingerprint="l",
+    )
+    real_write = state_store_module.os.write
+    write_sizes = []
+
+    def short_write(fd, data):
+        chunk = bytes(data[: min(5, len(data))])
+        write_sizes.append(len(chunk))
+        return real_write(fd, chunk)
+
+    monkeypatch.setattr(state_store_module.os, "write", short_write)
+
+    store = BurnBarE2EEStateStore(path)
+    store.initialize_pairing_bucket(bucket)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["signed"][bucket]["outboundNextCounter"] == 1
+    assert len(write_sizes) > 1

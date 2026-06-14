@@ -28,6 +28,7 @@ from tests.gateway.test_burnbar_plugin_v5 import (
     _paired_v5_adapter,
     RELAY_V5_AVAILABLE,
 )
+from tests.gateway.test_burnbar_plugin import _FakeResponse
 
 requires_v5 = pytest.mark.skipif(
     not RELAY_V5_AVAILABLE, reason="cryptography HPKE MLKEM768_X25519 unavailable"
@@ -53,6 +54,12 @@ def _write_file(tmp_path, name, content: bytes):
     p = tmp_path / name
     p.write_bytes(content)
     return p
+
+
+def _outbound_counter_entry(adapter):
+    bucket = adapter._signed_replay_bucket("burnbar:home")
+    signed = adapter._e2ee_state._state.get("signed", {})
+    return dict(signed.get(bucket) or {})
 
 
 def _phone_open_attachment(envelope, body_bytes, k, *, version):
@@ -160,6 +167,21 @@ def test_attachment_v5_pin_fails_closed_without_peer_caps(monkeypatch, tmp_path)
 
 
 @requires_v5
+def test_attachment_v5_refusal_does_not_burn_outbound_counter(monkeypatch, tmp_path):
+    k = _keys()
+    monkeypatch.delenv("BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS", raising=False)
+    monkeypatch.delenv("BURNBAR_ALLOW_CLASSICAL_ATTACHMENTS", raising=False)
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    before = _outbound_counter_entry(adapter)
+    f = _write_file(tmp_path, "x.bin", b"must not reserve a counter")
+    with pytest.raises(_burnbar._RelayPlaintextRefused):
+        adapter._sealer.seal_attachment(
+            destination_id="burnbar:home", file_path=f, content_type="application/octet-stream"
+        )
+    assert _outbound_counter_entry(adapter) == before
+
+
+@requires_v5
 def test_attachment_v5_pin_escape_hatch_allows_classical(monkeypatch, tmp_path):
     k = _keys()
     monkeypatch.delenv("BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS", raising=False)
@@ -186,6 +208,162 @@ def test_capability_payload_advertises_attachment_wrap(monkeypatch):
     assert 4 in cap["supportsGatewayAttachmentWrapVersions"]
     assert 2 not in cap["supportsGatewayAttachmentWrapVersions"]
     assert 3 not in cap["supportsGatewayAttachmentWrapVersions"]
+
+
+@requires_v5
+def test_attachment_wrap_caps_persist_from_authenticated_pairing_grant(monkeypatch, tmp_path):
+    saved: dict[str, str] = {}
+    removed: list[str] = []
+    k = _keys()
+    e2ee_state_file = tmp_path / "burnbar_e2ee_state.json"
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", e2ee_state_file)
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    (tmp_path / "replay.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS", "stale")
+    monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda key, value: saved.__setitem__(key, value))
+    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda key: removed.append(key) or True)
+    monkeypatch.setattr("hermes_cli.setup.get_env_value", lambda key: None)
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "https://api.example/v1/hermes-gateway")
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: True)
+    monkeypatch.setattr("hermes_cli.setup.print_header", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        relay_e2ee.AgentRelayIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: relay_e2ee.AgentRelayIdentity(k["agent_enc"])),
+    )
+    monkeypatch.setattr(
+        v4.AgentSigningIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: v4.AgentSigningIdentity(k["agent_sig"])),
+    )
+    monkeypatch.setattr(
+        v5.AgentKemIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: v5.AgentKemIdentity(k["agent_kem"])),
+    )
+
+    class _SyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            if url.endswith("/device/start"):
+                return _FakeResponse({
+                    "deviceCode": "dev",
+                    "userCode": "AB12-CD34",
+                    "interval": 0,
+                    "verificationUriComplete": "https://example.test",
+                })
+            if url.endswith("/device/poll"):
+                return _FakeResponse({
+                    "status": "approved",
+                    "accessToken": "tok",
+                    "homeDestinationId": "burnbar:home",
+                    "clientId": _CLIENT,
+                    "uid": _UID,
+                    "client": {
+                        "relayCapable": True,
+                        "phoneRelayPublicKey": k["phone_enc"].public_key_base64(),
+                        "phoneRelaySigningKey": k["phone_sig"].public_key_base64(),
+                        "phoneRelayKemPublicKey": k["phone_kem"].public_key_base64(),
+                        "gatewayRelayKeyVersion": 5,
+                        "supportsGatewayAttachmentWrapVersions": [5, 4, 3, "bad"],
+                    },
+                })
+            raise AssertionError(url)
+
+    monkeypatch.setattr(_burnbar.httpx, "Client", _SyncClient)
+
+    _burnbar.interactive_setup()
+
+    assert saved[_burnbar.RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV] == "4,5"
+    assert _burnbar.RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV not in removed
+
+
+@requires_v5
+def test_attachment_wrap_caps_are_cleared_when_pairing_grant_omits_them(monkeypatch, tmp_path):
+    saved: dict[str, str] = {}
+    removed: list[str] = []
+    k = _keys()
+    e2ee_state_file = tmp_path / "burnbar_e2ee_state.json"
+    monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", e2ee_state_file)
+    monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
+    (tmp_path / "replay.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda key, value: saved.__setitem__(key, value))
+    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda key: removed.append(key) or True)
+    monkeypatch.setattr("hermes_cli.setup.get_env_value", lambda key: None)
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "https://api.example/v1/hermes-gateway")
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: True)
+    monkeypatch.setattr("hermes_cli.setup.print_header", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.print_warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        relay_e2ee.AgentRelayIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: relay_e2ee.AgentRelayIdentity(k["agent_enc"])),
+    )
+    monkeypatch.setattr(
+        v4.AgentSigningIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: v4.AgentSigningIdentity(k["agent_sig"])),
+    )
+    monkeypatch.setattr(
+        v5.AgentKemIdentity,
+        "load_or_create",
+        classmethod(lambda cls, **kw: v5.AgentKemIdentity(k["agent_kem"])),
+    )
+
+    class _SyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            if url.endswith("/device/start"):
+                return _FakeResponse({
+                    "deviceCode": "dev",
+                    "userCode": "AB12-CD34",
+                    "interval": 0,
+                    "verificationUriComplete": "https://example.test",
+                })
+            if url.endswith("/device/poll"):
+                return _FakeResponse({
+                    "status": "approved",
+                    "accessToken": "tok",
+                    "homeDestinationId": "burnbar:home",
+                    "clientId": _CLIENT,
+                    "uid": _UID,
+                    "client": {
+                        "relayCapable": True,
+                        "phoneRelayPublicKey": k["phone_enc"].public_key_base64(),
+                        "phoneRelaySigningKey": k["phone_sig"].public_key_base64(),
+                        "phoneRelayKemPublicKey": k["phone_kem"].public_key_base64(),
+                        "gatewayRelayKeyVersion": 5,
+                    },
+                })
+            raise AssertionError(url)
+
+    monkeypatch.setattr(_burnbar.httpx, "Client", _SyncClient)
+
+    _burnbar.interactive_setup()
+
+    assert _burnbar.RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV not in saved
+    assert _burnbar.RELAY_PEER_ATTACHMENT_WRAP_VERSIONS_ENV in removed
 
 
 # ── Adversarial: a tampered manifest signature is refused (forgery). ─────────────

@@ -71,6 +71,7 @@ def _paired_v4_adapter(
     monkeypatch.setenv("BURNBAR_RELAY_UID", _UID)
     monkeypatch.setenv("BURNBAR_RELAY_CLIENT_ID", _CLIENT)
     monkeypatch.setenv("BURNBAR_RELAY_PEER_KEY_VERSION", "4")
+    monkeypatch.setenv("BURNBAR_RELAY_PEER_KEY_EPOCH", "0")
     monkeypatch.setenv("BURNBAR_RELAY_SIGNING_KEY", agent_sig.raw_base64())
     monkeypatch.delenv("BURNBAR_DISABLE_GATEWAY_HPKE_V3", raising=False)
     if disable_v4:

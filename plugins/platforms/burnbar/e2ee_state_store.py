@@ -417,17 +417,33 @@ class BurnBarE2EEStateStore:
         tmp = self._path.with_name(f"{self._path.name}.tmp")
         data = json.dumps(state, separators=(",", ":")).encode("utf-8")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        replaced = False
         try:
-            os.write(fd, data)
+            offset = 0
+            while offset < len(data):
+                written = os.write(fd, data[offset:])
+                if written <= 0:
+                    raise BurnBarE2EEStateError(
+                        f"short write while persisting durable security state: {self._path}"
+                    )
+                offset += written
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, self._path)
-        dir_fd = os.open(self._path.parent, os.O_RDONLY)
         try:
-            os.fsync(dir_fd)
+            os.replace(tmp, self._path)
+            replaced = True
+            dir_fd = os.open(self._path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         finally:
-            os.close(dir_fd)
+            if not replaced:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def _file_lock(self):
         return _FileLock(self._lock_path)

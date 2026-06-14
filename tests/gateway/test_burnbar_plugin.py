@@ -201,6 +201,7 @@ def test_relay_safety_code_is_two_key_signal_style_128_bit():
 
 def test_apply_yaml_config_preserves_env_precedence(monkeypatch):
     monkeypatch.setenv("BURNBAR_ACCESS_TOKEN", "env-token")
+    monkeypatch.delenv("BURNBAR_API_BASE_URL", raising=False)
     platform_cfg = {"extra": {"existing": "value"}}
 
     extra = _apply_yaml_config(
@@ -266,6 +267,15 @@ def _legacy_adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(_burnbar, "REPLAY_LEDGER_FILE", tmp_path / "replay.json")
     monkeypatch.setattr(_burnbar, "BURNBAR_E2EE_STATE_FILE", tmp_path / "e2ee.json")
     monkeypatch.delenv("BURNBAR_RELAY_E2E", raising=False)
+    for key in (
+        "BURNBAR_RELAY_PEER_PUBLIC_KEY",
+        "BURNBAR_RELAY_PEER_KEY_VERSION",
+        "BURNBAR_RELAY_PEER_KEY_EPOCH",
+        "BURNBAR_RELAY_PEER_SIGNING_KEY",
+        "BURNBAR_RELAY_PEER_KEM_PUBLIC_KEY",
+        "BURNBAR_RELAY_PEER_ATTACHMENT_WRAP_VERSIONS",
+    ):
+        monkeypatch.delenv(key, raising=False)
     cfg = PlatformConfig(enabled=True, extra={"access_token": "tok", "home_channel": "burnbar:home"})
     return BurnBarAdapter(cfg)
 

@@ -1,13 +1,14 @@
-"""ADVERSARIAL AUDIT repros for the v4-signed ratchet_init lane.
+"""ADVERSARIAL AUDIT repros for the v4/v5 signed ratchet_init lanes.
 
-These are HOSTILE follow-up repros for RATCHET_INIT_ADVERSARIAL_AUDIT_HANDOFF.md.
-They go beyond the shipped regression tests: they probe the downgrade floor for a
-ratchet_init payload, the per-field handshake binding in the handler in isolation,
-init replay against an advanced session, re-init after session-file loss, malformed
-key material, the missing-replayCounter gate, and the (un)enforcement of the
-recorded ratchet receive high-water.
+Hostile follow-up repros for V5_ADVERSARIAL_AUDIT_HANDOFF.md. They go beyond the
+shipped regression suites and probe downgrade floors, per-field handshake binding,
+init replay against advanced sessions, re-init after session-file loss, malformed
+key material, the missing-replayCounter gate, v5 envelope forgery/relabeling, and
+the enforcement of the durable ratchet receive high-water.
 
 Run: pytest tests/gateway/test_audit_adversarial.py -q
+Also: pytest tests/gateway/test_adversarial_v5_handoff.py -q
+      pytest tests/gateway/test_v5_adversarial_probe.py -q
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import json
 import pytest
 
 # Reuse the shipped v4 test harness verbatim.
+from gateway.crypto import relay_e2ee_v5
+
 from tests.gateway.test_burnbar_plugin_v4 import (
     _burnbar,
     relay_e2ee,
@@ -32,6 +35,15 @@ from tests.gateway.test_burnbar_plugin_v4 import (
     _phone_ratchet_frame,
     _phone_to_agent_v4_event,
     RELAY_CRYPTO_AVAILABLE,
+)
+from tests.gateway.test_burnbar_plugin_v5 import (
+    _keys as _v5_keys,
+    _paired_v5_adapter,
+    _phone_to_agent_v5_event,
+    _signed_ratchet_init_v2,
+    _v5_pinned_adapter_without_local_kem,
+    requires_v5,
+    v5,
 )
 
 requires_relay = pytest.mark.skipif(
@@ -315,5 +327,157 @@ async def test_receive_high_water_enforced_after_session_rollback(monkeypatch):
         "id": "rm0-replay", "destinationId": "burnbar:home",
         "ratchetEnvelope": f0["ratchetEnvelope"],
     })
+    assert [e.text for e in received] == ["m0"]
+    assert not adapter._can_ratchet("burnbar:home")
+
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v5_wrong_signature(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    received = _capture(adapter)
+    raw = _phone_to_agent_v5_event(event_id="bad-sig", payload={"text":"hi", "destinationId":"burnbar:home", "replayCounter":1}, **k)
+    sig = bytearray(base64.b64decode(raw["relayEnvelope"]["senderSig"]))
+    sig[0] ^= 1
+    raw["relayEnvelope"]["senderSig"] = base64.b64encode(sig).decode()
+    await adapter._handle_burnbar_event(raw)
+    assert not received
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v5_wrong_recipient_kem(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    received = _capture(adapter)
+    wrong_kem = relay_e2ee_v5.generate_kem_private_key()
+    raw = _phone_to_agent_v5_event(event_id="bad-kem", payload={"text":"hi", "destinationId":"burnbar:home", "replayCounter":1}, **k)
+    payload_aad = _burnbar._gateway_message_aad(_UID, _CLIENT, "bad-kem")
+    key_aad = _burnbar._gateway_message_key_aad(_UID, _CLIENT, "bad-kem")
+    env = relay_e2ee_v5.seal_signed_v5(
+        json.dumps({"text":"hi", "destinationId":"burnbar:home", "replayCounter":1}).encode("utf-8"),
+        recipient_kem_public=wrong_kem.public_key(),
+        recipient_verify_key=k["agent_sig"].public_key_base64(),
+        sender_signing_key=k["phone_sig"],
+        key_aad=key_aad,
+        payload_aad=payload_aad,
+    )
+    raw["relayEnvelope"]["payloadCiphertext"] = env.payload_ciphertext
+    raw["relayEnvelope"]["wrappedKey"] = env.wrapped_key
+    raw["relayEnvelope"]["enc"] = env.enc
+    raw["relayEnvelope"]["senderSig"] = env.sender_sig
+    await adapter._handle_burnbar_event(raw)
+    assert not received
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v5_relabeled(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    received = _capture(adapter)
+    raw = _phone_to_agent_v5_event(event_id="relabeled", payload={"text":"hi", "destinationId":"burnbar:home", "replayCounter":1}, **k)
+    for version in [4, 3, 2, None, "bad"]:
+        modified = copy.deepcopy(raw)
+        modified["relayEnvelope"]["relayKeyVersion"] = version
+        await adapter._handle_burnbar_event(modified)
+        assert not received
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v5_missing_local_kem(monkeypatch):
+    k = _v5_keys()
+    adapter = _v5_pinned_adapter_without_local_kem(monkeypatch, **k)
+    received = _capture(adapter)
+    k4 = {k_: v for k_, v in k.items() if not k_.endswith("_kem")}
+    raw = _phone_to_agent_v4_event(event_id="v4-event", payload={"text":"hi", "destinationId":"burnbar:home", "replayCounter":1}, **k4)
+    await adapter._handle_burnbar_event(raw)
+    assert not received
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v2_ratchet_init_wrong_kem_key_id(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    received = _capture(adapter)
+    init_raw, phone, payload = _signed_ratchet_init_v2(adapter, k, event_id="bad-kem-id")
+    payload["responderKemKeyID"] = "wrong-id"
+    raw = _phone_to_agent_v5_event(event_id="bad-kem-id", payload=payload, **k)
+    await adapter._handle_burnbar_event(raw)
+    assert not adapter._can_ratchet("burnbar:home")
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v2_ratchet_init_tampered_fields(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    _raw, phone, base_payload = _signed_ratchet_init_v2(adapter, k)
+    wrong_pair = hr.generate_key_pair()
+
+    def mutate(**overrides):
+        p = copy.deepcopy(base_payload)
+        p.update(overrides)
+        return p
+
+    cases = {
+        "destinationId": mutate(destinationId="burnbar:other"),
+        "sessionID": mutate(sessionID="0" * 64),
+        "replayCounter": mutate(replayCounter=999),
+        "initiatorRatchetPublicKeyBase64": mutate(initiatorRatchetPublicKeyBase64=wrong_pair.public_key_base64),
+        "responderRatchetPublicKeyBase64": mutate(responderRatchetPublicKeyBase64=wrong_pair.public_key_base64),
+        "initiatorDeviceID": mutate(initiatorDeviceID="0" * 32),
+        "responderDeviceID": mutate(responderDeviceID="0" * 32),
+        "kemCiphertextBase64": mutate(kemCiphertextBase64=base64.b64encode(b"\x00" * 1088).decode("ascii")),
+        "rootConfirmMacBase64": mutate(rootConfirmMacBase64=base64.b64encode(b"\x00" * 32).decode("ascii")),
+    }
+
+    for name, payload in cases.items():
+        assert adapter._handle_sealed_ratchet_init(payload) is False, f"{name} should be refused"
+        assert adapter._ratchet_session("burnbar:home") is None, f"{name} left a session"
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_v2_ratchet_init_crash_injection(monkeypatch):
+    from unittest.mock import patch
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    init_raw, phone, payload = _signed_ratchet_init_v2(adapter, k, event_id="crash")
+    with patch.object(adapter, "_save_ratchet_sessions", return_value=False):
+        await adapter._handle_burnbar_event(init_raw)
+    assert adapter._ratchet_session("burnbar:home") is None
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_ratchet_disabled(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    init_raw, phone, payload = _signed_ratchet_init_v2(adapter, k)
+    monkeypatch.setenv("BURNBAR_DISABLE_GATEWAY_RATCHET", "1")
+    kem_pub, kem_id = adapter._ratchet_init_kem_key_for_advertisement()
+    assert kem_pub is None
+    await adapter._handle_burnbar_event(init_raw)
+    assert not adapter._can_ratchet("burnbar:home")
+
+@requires_v5
+@pytest.mark.asyncio
+async def test_restored_old_ratchet_session(monkeypatch):
+    k = _v5_keys()
+    adapter = _paired_v5_adapter(monkeypatch, **k)
+    received = _capture(adapter)
+    init_raw, phone, payload = _signed_ratchet_init_v2(adapter, k)
+    await adapter._handle_burnbar_event(init_raw)
+    sid = payload["sessionID"]
+
+    f0 = _phone_ratchet_frame(phone, {"text": "m0", "destinationId": "burnbar:home"}, "rm0")
+    snapshot = copy.deepcopy(adapter._ratchet_session("burnbar:home"))
+    await adapter._handle_burnbar_event(f0)
+
+    adapter._ratchet_sessions["burnbar:home"] = copy.deepcopy(snapshot)
+    adapter._save_ratchet_sessions()
+
+    await adapter._handle_burnbar_event({
+        "id": "rm0-replay", "destinationId": "burnbar:home",
+        "ratchetEnvelope": f0["ratchetEnvelope"],
+    })
+
     assert [e.text for e in received] == ["m0"]
     assert not adapter._can_ratchet("burnbar:home")
