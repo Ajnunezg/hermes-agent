@@ -1,0 +1,41 @@
+# OpenBurnBarEngine spike — macOS clean-build log (VAL-P0-CORE-014)
+# host: macOS 27.0  arch: arm64
+swift-driver version: 1.167 Apple Swift version 6.4 (swiftlang-6.4.0.20.104 clang-2100.3.20.102)
+Target: arm64-apple-macosx27.0.0
+# command: rm -rf .build && swift build   (no Vendor deps, no remote package resolution)
+# ---
+Building for debugging...
+[Pre-planning 1 / 95]
+[Planning deferred tasks]
+[24 / 41] OpenBurnBarEngine
+[24 / 41]
+[25 / 42] OpenBurnBarFirestoreModels
+[35 / 91]
+[37 / 91]
+[42 / 91]
+[44 / 91]
+[47 / 91]
+[48 / 91]
+[49 / 91]
+[50 / 91]
+[51 / 91]
+[53 / 91]
+[56 / 91]
+[57 / 91]
+[58 / 91]
+[59 / 91]
+[74 / 91] OpenBurnBarFirestoreModels
+[81 / 92] OpenBurnBarEngine
+[86 / 98] OpenBurnBarEngine
+[86 / 98] OpenBurnBarFirestoreModels
+[93 / 98]
+[93 / 98] OpenBurnBarEngine
+[93 / 98] OpenBurnBarFirestoreModels
+[93 / 98] OpenBurnBarEngine
+[93 / 98] OpenBurnBarFirestoreModels
+[95 / 98] OpenBurnBarEngine
+[97 / 98] OpenBurnBarEngine
+Build complete! (18.22 sec)
+# --- build exit:  ---
+# import audit of compiled target:
+  19 import Foundation
